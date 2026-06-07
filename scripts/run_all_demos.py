@@ -110,13 +110,13 @@ def run_theory_demo(user_profiles: pd.DataFrame, verbose: bool = True) -> dict:
     results = {}
     try:
         from src.simulation.cognitive_agent_theory import TheoreticalCognitiveAgent, MentalAccountType
+        import numpy as np
 
         agents = {}
         for account_type in MentalAccountType:
             agent = TheoreticalCognitiveAgent(
                 agent_id=f"demo_{account_type.value}",
                 mental_account=account_type,
-                price_sensitivity=np.random.uniform(0.2, 0.8),
             )
             agents[account_type.value] = agent
 
@@ -136,6 +136,8 @@ def run_theory_demo(user_profiles: pd.DataFrame, verbose: bool = True) -> dict:
     except Exception as e:
         if verbose:
             print(f"  Cognitive Agent Theory FAILED: {e}")
+        import traceback
+        traceback.print_exc()
 
     return results
 
@@ -189,10 +191,13 @@ def run_abm_demo(user_profiles: pd.DataFrame, verbose: bool = True) -> dict:
 
         sc = SocialContagion()
         seed_nodes = list(range(50))
-        infected_history = sc.propagate(G, seed_nodes, contagion_rate=0.15, n_steps=10)
-        results["network"]["cascade_size"] = infected_history[-1]
+        contagion_result = sc.propagate(G, seed_nodes, contagion_rate=0.15, n_steps=10)
+        results["network"]["cascade_size"] = contagion_result["cascade_size"]
+        results["network"]["cascade_ratio"] = contagion_result["cascade_ratio"]
         if verbose:
-            print(f"  Contagion: seed={len(seed_nodes)}, final_infected={infected_history[-1]}")
+            print(f"  Contagion: seed={len(seed_nodes)}, "
+                  f"final_infected={contagion_result['cascade_size']} "
+                  f"({contagion_result['cascade_ratio']:.1%})")
     except Exception as e:
         if verbose:
             print(f"  NetworkX FAILED: {e}")
@@ -232,25 +237,85 @@ def run_multiworld_demo(verbose: bool = True) -> dict:
 
 
 def run_llm_agent_demo(verbose: bool = True) -> dict:
-    """运行 LLM Agent 演示"""
+    """运行 LLM Agent 演示（优先使用真实 API）"""
     if verbose:
         print(separator("PHASE 3: LLM Agent Simulation"))
 
     results = {}
     try:
-        from src.simulation.llm_agent import LLMAgentSociety
+        from src.simulation.llm_agent import LLMClient, LLMAgentSociety
+        import os
 
-        society = LLMAgentSociety(n_agents=5, use_mock=True)
-        sim_results = society.run_simulation(n_rounds=3)
+        # 自动检测可用后端
+        has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+        has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
+        has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+        if has_deepseek:
+            backend = "deepseek"
+            api_key = os.environ["DEEPSEEK_API_KEY"]
+            use_mock = False
+        elif has_openai:
+            backend = "openai"
+            api_key = os.environ["OPENAI_API_KEY"]
+            use_mock = False
+        elif has_anthropic:
+            backend = "anthropic"
+            api_key = os.environ["ANTHROPIC_API_KEY"]
+            use_mock = False
+        else:
+            backend = "mock"
+            api_key = None
+            use_mock = True
+
+        mode_label = f"{backend.upper()} (真实LLM)" if not use_mock else "Mock (规则回退)"
+        if verbose:
+            print(f"  Backend: {mode_label}")
+
+        # 创建 LLM 客户端
+        llm_client = LLMClient(
+            backend=backend,
+            api_key=api_key,
+        )
+
+        # 创建 Agent 社会（小规模的演示）
+        society = LLMAgentSociety(
+            n_agents=4,
+            use_mock=use_mock,
+            backend=backend,
+            api_key=api_key,
+            seed=42,
+        )
+
+        # 运行 3 轮，递增门槛以观察决策分化
+        scenarios = [(20, 50), (15, 100), (10, 150)]
+        sim_results = []
+
+        for subsidy, threshold in scenarios:
+            r_result = society.run_round(subsidy_amount=subsidy, threshold=threshold)
+            sim_results.append(r_result)
+            if verbose:
+                print(f"  Round {r_result['round']}: subsidy=¥{subsidy}, "
+                      f"threshold=¥{threshold}, "
+                      f"redemption={r_result['redemption_rate']:.0%} "
+                      f"({r_result['n_redeemed']}/{society.n_agents})")
+
         results["sim_results"] = sim_results
 
-        if verbose:
-            print(f"  LLM Agent simulation completed: {len(sim_results)} rounds")
-            for r_result in sim_results:
-                print(f"  Round {r_result['round']}: redemption_rate={r_result['redemption_rate']:.2%}")
+        # 按心理账户汇总
+        traj_df = society.get_trajectory_df()
+        results["trajectory_df"] = traj_df  # 传给 save_results 保存
+        if not traj_df.empty and verbose:
+            print(f"\n  各心理账户核销率:")
+            for acc, group in traj_df.groupby("mental_account"):
+                rate = group["redeemed"].mean()
+                print(f"    {acc:<25s}: {rate:.0%} ({int(group['redeemed'].sum())}/{len(group)})")
+
     except Exception as e:
         if verbose:
             print(f"  LLM Agent FAILED: {e}")
+        import traceback
+        traceback.print_exc()
 
     return results
 
@@ -346,6 +411,21 @@ def save_results(all_results: dict, output_dir: str = "output") -> None:
             pd.DataFrame(eval_rows).to_csv(
                 os.path.join(output_dir, "evaluation_results.csv"), index=False
             )
+
+    # 保存 LLM Agent 轨迹（含 reasoning chain）
+    if "llm" in all_results:
+        llm = all_results["llm"]
+        traj_df = llm.get("trajectory_df")
+        if traj_df is not None and not traj_df.empty:
+            traj_path = os.path.join(output_dir, "llm_agent_trajectories.csv")
+            traj_df.to_csv(traj_path, index=False, encoding="utf-8-sig")
+            print(f"  LLM trajectories saved to: {traj_path}")
+
+            # 同时保存完整 JSON（含完整 reasoning，CSV 会截断长文本）
+            import json
+            json_path = os.path.join(output_dir, "llm_agent_trajectories.json")
+            traj_df.to_json(json_path, orient="records", force_ascii=False, indent=2)
+            print(f"  LLM trajectories (JSON, full reasoning) saved to: {json_path}")
 
     print(f"\nResults saved to {output_dir}/")
 
