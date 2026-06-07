@@ -1,0 +1,53 @@
+# AI Subsidy Simulation - Git Ignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Data files (competition data should not be uploaded)
+data/*
+!data/synthetic/
+!data/synthetic/**
+!data/README.md
+*.xlsx
+*.csv
+*.json
+
+# Output files
+output/
+figures/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Competition specific files
+*初赛*
+*竞赛*
+*美团商务分析*
+
+# Large files
+*.pth
+*.pt
+*.h5
+*.pkl
+*.model
