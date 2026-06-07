@@ -1,21 +1,23 @@
 """
 LLM Agent 补贴仿真运行脚本
 
-使用合成数据测试LLM Agent仿真模块。
-- 如果有API Key（OPENAI_API_KEY / ANTHROPIC_API_KEY），使用真实LLM
-- 如果没有API Key，自动回退到Mock模式（随机决策但保留推理格式）
+使用 LLMSubsidyAgent / LLMAgentSociety 进行仿真。
+- 如果环境变量设置了 OPENAI_API_KEY 或 ANTHROPIC_API_KEY，可接入真实 LLM
+- 默认回退到 Mock 模式（基于规则的决策，保留推理格式）
 
 用法：
     python scripts/run_llm_agent.py
+    python scripts/run_llm_agent.py --n-agents 50 --n-rounds 10
+    python scripts/run_llm_agent.py --backend openai --model gpt-4o-mini
 
 环境变量：
-    OPENAI_API_KEY: OpenAI API密钥
-    ANTHROPIC_API_KEY: Anthropic API密钥
-    LLM_MODEL: 指定模型名称（默认 gpt-4o）
+    OPENAI_API_KEY:   OpenAI API 密钥
+    ANTHROPIC_API_KEY: Anthropic API 密钥
+    LLM_BACKEND:       强制指定后端 (openai / anthropic / mock)
 
 参考文献：
 - Park et al. (2023): Generative Agents
-- AgentSociety (Tsinghua): LLM-based Agent Simulation Framework
+- Horton (2023): Homo Silicus, NBER Working Paper
 """
 
 from __future__ import annotations
@@ -26,52 +28,262 @@ import json
 import time
 import argparse
 from pathlib import Path
+from typing import Optional
 
-# 添加src到路径
+import numpy as np
+import pandas as pd
+
+# 添加 src 到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.simulation.llm_agent import (
     PromptTemplate,
+    LLMClient,
     LLMSubsidyAgent,
     LLMAgentSociety,
-    AgentProfile,
-    SubsidyInfo,
-    AgentDecision,
-    MockLLM,
-    create_agent_society,
-    HAS_OPENAI,
-    HAS_ANTHROPIC,
-    HAS_AGENT_SOCIETY,
-    OPENAI_API_KEY,
-    ANTHROPIC_API_KEY,
+    run_llm_simulation,
 )
 
 
-def parse_args():
-    """解析命令行参数"""
+# ===========================================================================
+# 环境检查
+# ===========================================================================
+
+def check_environment() -> str:
+    """检查运行环境，返回运行模式描述"""
+    print("=" * 60)
+    print("环境检查")
+    print("=" * 60)
+
+    has_openai_key = bool(os.environ.get("OPENAI_API_KEY"))
+    has_anthropic_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    backend_env = os.environ.get("LLM_BACKEND", "").strip()
+
+    env_status = {
+        "OPENAI_API_KEY": "已设置" if has_openai_key else "未设置",
+        "ANTHROPIC_API_KEY": "已设置" if has_anthropic_key else "未设置",
+        "LLM_BACKEND (env override)": backend_env if backend_env else "未设置 (自动选择)",
+    }
+
+    for key, value in env_status.items():
+        icon = "+" if ("已设置" in value or value == "openai" or value == "anthropic") else "-"
+        print(f"  [{icon}] {key}: {value}")
+
+    # 确定运行模式
+    if backend_env == "openai" or (not backend_env and has_openai_key):
+        mode = "OpenAI API (真实 LLM)"
+    elif backend_env == "anthropic" or (not backend_env and has_anthropic_key):
+        mode = "Anthropic API (真实 LLM)"
+    else:
+        mode = "Mock 模式 (基于规则的决策回退)"
+
+    print(f"\n  运行模式: {mode}")
+    print()
+    return mode
+
+
+# ===========================================================================
+# 单 Agent 决策测试
+# ===========================================================================
+
+def run_single_agent_test(args, llm_client: LLMClient):
+    """测试单个 Agent 的决策输出格式"""
+    print("=" * 60)
+    print("单 Agent 决策测试")
+    print("=" * 60)
+
+    # 创建 4 种心理账户的 Agent（仅测试决策格式，不依赖真实 LLM）
+    test_profiles = [
+        {"agent_id": "test_windfall", "mental_account": "windfall_spender", "price_sensitivity": 0.2},
+        {"agent_id": "test_price_sensitive", "mental_account": "price_sensitive", "price_sensitivity": 0.9},
+        {"agent_id": "test_routine", "mental_account": "routine_income", "price_sensitivity": 0.4},
+        {"agent_id": "test_deal_seeker", "mental_account": "deal_seeker", "price_sensitivity": 0.7},
+    ]
+
+    agents = []
+    for p in test_profiles:
+        agent = LLMSubsidyAgent(
+            agent_id=p["agent_id"],
+            mental_account=p["mental_account"],
+            price_sensitivity=p["price_sensitivity"],
+            income_level=3,
+            consumption_freq=5,
+            llm_client=llm_client,
+        )
+        agents.append(agent)
+
+    # 显示系统提示词（截取前 200 字符）
+    print("\n系统提示词模板预览（windfall_spender）:")
+    sys_prompt = PromptTemplate.get_system_prompt("windfall_spender")
+    print(f"  {sys_prompt[:200]}...")
+
+    # 对每个 Agent 执行一轮决策
+    subsidy_amount = 20.0
+    threshold = 80.0
+
+    print(f"\n决策测试（补贴金额={subsidy_amount}元，门槛={threshold}元）:")
+    for agent in agents:
+        result = agent.decide(subsidy_amount=subsidy_amount, threshold=threshold)
+        accepted = result["redeemed"]
+        reasoning = result.get("reasoning", "")[:80]
+        confidence = result.get("confidence", 0.0)
+        print(f"  [{agent.mental_account:<20s}] "
+              f"决策: {'核销' if accepted else '不核销'} | "
+              f"信心: {confidence:.2f} | 推理: {reasoning}...")
+
+    print()
+    return agents
+
+
+# ===========================================================================
+# 完整多 Agent 多轮仿真
+# ===========================================================================
+
+def run_full_simulation(args, llm_client: LLMClient) -> Optional[pd.DataFrame]:
+    """运行完整仿真并输出汇总"""
+    print("=" * 60)
+    print("多 Agent 多轮仿真实验")
+    print("=" * 60)
+
+    np.random.seed(args.seed)
+
+    # 创建 Agent 社会
+    print(f"\n创建 {args.n_agents} 个 LLM Agent...")
+    start_time = time.time()
+
+    society = LLMAgentSociety(
+        n_agents=args.n_agents,
+        use_mock=(llm_client.backend == "mock"),
+        backend=llm_client.backend,
+        api_key=llm_client.api_key,
+        seed=args.seed,
+    )
+
+    # 统计心理账户分布
+    account_counts: dict = {}
+    for agent in society.agents:
+        acc = agent.mental_account
+        account_counts[acc] = account_counts.get(acc, 0) + 1
+    print(f"心理账户分布: {account_counts}")
+
+    # 执行多轮仿真
+    print(f"\n开始 {args.n_rounds} 轮仿真...")
+    sim_start = time.time()
+
+    for r in range(args.n_rounds):
+        subsidy = args.base_subsidy + r * args.subsidy_increment
+        threshold = args.base_threshold + r * args.threshold_increment
+        result = society.run_round(subsidy_amount=subsidy, threshold=threshold)
+        mode_label = "MOCK" if society.use_mock else "LLM"
+        if not args.quiet:
+            print(f"  Round {result['round']} [{mode_label}]: "
+                  f"subsidy=¥{subsidy:.0f}, threshold=¥{threshold:.0f}, "
+                  f"redemption_rate={result['redemption_rate']:.2%} "
+                  f"({result['n_redeemed']}/{society.n_agents})")
+
+    sim_time = time.time() - sim_start
+    total_time = time.time() - start_time
+
+    # 输出汇总
+    summary_df = society.get_summary()
+    print(f"\n{'=' * 60}")
+    print("仿真结果汇总")
+    print(f"{'=' * 60}")
+    print(f"  仿真耗时: {sim_time:.2f}s (总计: {total_time:.2f}s)")
+    print(f"  平均核销率: {summary_df['redemption_rate'].mean():.2%}")
+    print()
+    print(summary_df.to_string(index=False))
+
+    # 心理账户维度汇总
+    traj_df = society.get_trajectory_df()
+    if not traj_df.empty:
+        print(f"\n各心理账户核销率:")
+        for acc, group in traj_df.groupby("mental_account"):
+            rate = group["redeemed"].mean()
+            bar = "█" * int(rate * 30)
+            print(f"  {acc:<25s}: {rate:.2%} {bar}")
+
+    # 保存结果
+    if args.output:
+        output_path = args.output
+    else:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = str(output_dir / f"llm_agent_simulation_{timestamp}.json")
+
+    output_data = {
+        "config": {
+            "n_agents": args.n_agents,
+            "n_rounds": args.n_rounds,
+            "backend": llm_client.backend,
+            "seed": args.seed,
+            "base_subsidy": args.base_subsidy,
+            "subsidy_increment": args.subsidy_increment,
+            "base_threshold": args.base_threshold,
+            "threshold_increment": args.threshold_increment,
+        },
+        "summary": summary_df.to_dict(orient="records"),
+        "trajectories": traj_df.to_dict(orient="records") if not traj_df.empty else [],
+        "simulation_time": sim_time,
+        "total_time": total_time,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, ensure_ascii=False, indent=2, default=str)
+
+    print(f"\n结果已保存到: {output_path}")
+
+    # 同时保存 CSV
+    if not traj_df.empty:
+        csv_path = output_path.replace(".json", ".csv")
+        traj_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        print(f"决策轨迹 CSV 已保存到: {csv_path}")
+
+    print()
+    return summary_df
+
+
+# ===========================================================================
+# 命令行参数
+# ===========================================================================
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="LLM Agent 补贴仿真实验"
     )
     parser.add_argument(
         "--n-agents", type=int, default=20,
-        help="Agent数量 (默认: 20)"
+        help="Agent 数量 (默认: 20)"
     )
     parser.add_argument(
         "--n-rounds", type=int, default=6,
         help="仿真轮数 (默认: 6)"
     )
     parser.add_argument(
-        "--model", type=str, default=os.environ.get("LLM_MODEL", "gpt-4o"),
-        help="LLM模型名称 (默认: gpt-4o)"
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=0.7,
-        help="LLM温度参数 (默认: 0.7)"
-    )
-    parser.add_argument(
         "--backend", type=str, default=None,
         choices=["openai", "anthropic", "mock"],
-        help="强制指定后端 (默认: 自动选择)"
+        help="强制指定 LLM 后端 (默认: 自动选择)"
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="LLM 模型名称 (默认: gpt-4o-mini / claude-3-haiku)"
+    )
+    parser.add_argument(
+        "--base-subsidy", type=float, default=10.0,
+        help="初始补贴金额 (默认: 10.0)"
+    )
+    parser.add_argument(
+        "--subsidy-increment", type=float, default=2.0,
+        help="每轮补贴递增金额 (默认: 2.0)"
+    )
+    parser.add_argument(
+        "--base-threshold", type=float, default=30.0,
+        help="初始使用门槛 (默认: 30.0)"
+    )
+    parser.add_argument(
+        "--threshold-increment", type=float, default=5.0,
+        help="每轮门槛递增值 (默认: 5.0)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -79,423 +291,74 @@ def parse_args():
     )
     parser.add_argument(
         "--output", type=str, default=None,
-        help="结果输出JSON路径 (可选)"
+        help="结果输出 JSON 路径 (可选)"
     )
     parser.add_argument(
-        "--parallel", action="store_true",
-        help="并行执行决策"
+        "--output-dir", type=str, default="data/results",
+        help="输出目录 (默认: data/results)"
     )
     parser.add_argument(
         "--quiet", action="store_true",
-        help="静默模式（减少输出）"
+        help="静默模式（减少每轮输出）"
     )
     parser.add_argument(
         "--demo", action="store_true",
-        help="快速演示模式（5个Agent，2轮）"
+        help="快速演示模式（5 个 Agent，2 轮）"
     )
     return parser.parse_args()
 
 
-def check_environment():
-    """检查运行环境"""
-    print("=" * 60)
-    print("环境检查")
-    print("=" * 60)
-
-    env_status = {
-        "OpenAI API Key": "已设置" if HAS_OPENAI else "未设置",
-        "Anthropic API Key": "已设置" if HAS_ANTHROPIC else "未设置",
-        "AgentSociety (清华)": "可用" if HAS_AGENT_SOCIETY else "不可用",
-    }
-
-    for key, value in env_status.items():
-        status_icon = "+" if "已设置" in value or "可用" in value else "-"
-        print(f"  [{status_icon}] {key}: {value}")
-
-    # 确定运行模式
-    if HAS_OPENAI:
-        mode = "OpenAI API (真实LLM)"
-    elif HAS_ANTHROPIC:
-        mode = "Anthropic API (真实LLM)"
-    else:
-        mode = "Mock模式 (基于规则的随机决策)"
-
-    print(f"\n  运行模式: {mode}")
-    print()
-
-    return mode
-
-
-def create_subsidy_scenarios(n_rounds: int) -> list:
-    """
-    创建多轮补贴策略场景
-
-    设计不同的A/B测试策略组合：
-    - 面值梯度: 10, 15, 20, 25, 30, 35
-    - 门槛梯度: 30, 50, 80, 100, 120, 150
-    - 品类轮换: 通用, 餐饮, 购物, 出行, 娱乐, 通用
-    - 类型组合: 满减, 折扣, 满减, 直减, 满减, 折扣
-    """
-    scenarios = [
-        SubsidyInfo(
-            subsidy_id=f"scenario_{i+1}",
-            face_value=[10, 15, 20, 25, 30, 35][i],
-            threshold=[30, 50, 80, 100, 120, 150][i],
-            category=["通用", "餐饮", "购物", "出行", "娱乐", "通用"][i],
-            expire_days=[3, 5, 7, 7, 5, 3][i],
-            discount_type=["满减", "折扣", "满减", "直减", "满减", "折扣"][i],
-            discount_rate=[None, 0.85, None, None, None, 0.9][i],
-            subsidy_pool=100000.0
-        )
-        for i in range(n_rounds)
-    ]
-    return scenarios
-
-
-def run_single_agent_test(args):
-    """单个Agent的决策测试"""
-    print("=" * 60)
-    print("单Agent决策测试")
-    print("=" * 60)
-
-    # 创建4种心理账户的Agent
-    profiles = [
-        AgentProfile(
-            user_id="test_windfall",
-            mental_account="windfall_spender",
-            price_sensitivity=0.2,
-            monthly_budget=4000.0,
-            age_group="26-35",
-            income_level="medium",
-            category_preference=["餐饮", "购物"]
-        ),
-        AgentProfile(
-            user_id="test_price_sensitive",
-            mental_account="price_sensitive",
-            price_sensitivity=0.9,
-            monthly_budget=2500.0,
-            age_group="18-25",
-            income_level="low",
-            category_preference=["餐饮", "购物"]
-        ),
-        AgentProfile(
-            user_id="test_routine",
-            mental_account="routine_income",
-            price_sensitivity=0.4,
-            monthly_budget=6000.0,
-            age_group="36-50",
-            income_level="high",
-            category_preference=["出行", "教育"]
-        ),
-        AgentProfile(
-            user_id="test_deal_seeker",
-            mental_account="deal_seeker",
-            price_sensitivity=0.7,
-            monthly_budget=3500.0,
-            age_group="26-35",
-            income_level="medium",
-            category_preference=["购物", "娱乐"]
-        ),
-    ]
-
-    # 测试补贴
-    subsidy = SubsidyInfo(
-        subsidy_id="test_001",
-        face_value=20.0,
-        threshold=80.0,
-        category="餐饮",
-        expire_days=7,
-        discount_type="满减",
-        subsidy_pool=100000.0
-    )
-
-    for profile in profiles:
-        agent = LLMSubsidyAgent(
-            profile=profile,
-            model_name=args.model,
-            temperature=args.temperature,
-            backend=args.backend
-        )
-
-        print(f"\n--- {profile.user_id} ({profile.mental_account}) ---")
-        print(f"  系统提示词 (前150字):")
-        sys_prompt = agent.build_system_prompt()
-        print(f"  {sys_prompt[:150]}...")
-
-        print(f"\n  决策提示词:")
-        from src.simulation.llm_agent import PromptTemplate
-        decision_prompt = PromptTemplate.build_decision_prompt(subsidy, profile)
-        print(f"  {decision_prompt[:200]}...")
-
-        print(f"\n  决策结果:")
-        decision = agent.decide(subsidy, round_num=0)
-        print(f"    接受: {decision.accept}")
-        print(f"    概率: {decision.usage_probability:.2f}")
-        print(f"    预期消费: {decision.expected_spend:.0f}元")
-        print(f"    净收益: {decision.net_benefit:.0f}元")
-        print(f"    推理: {decision.reasoning}")
-        print(f"    后端: {decision.api_used} | 耗时: {decision.llm_call_time:.3f}s")
-
-
-def run_full_simulation(args):
-    """完整多Agent多轮仿真"""
-    print("=" * 60)
-    print("多Agent多轮仿真实验")
-    print("=" * 60)
-
-    # 创建Agent社会
-    print(f"\n创建 {args.n_agents} 个Agent...")
-    start_time = time.time()
-
-    society = create_agent_society(
-        n_agents=args.n_agents,
-        seed=args.seed,
-        model_name=args.model,
-        temperature=args.temperature,
-        verbose=not args.quiet
-    )
-    society.parallel = args.parallel
-
-    # 统计Agent分布
-    account_counts = {}
-    for agent in society.agents:
-        acc = agent.profile.mental_account
-        account_counts[acc] = account_counts.get(acc, 0) + 1
-    print(f"心理账户分布: {account_counts}")
-
-    # 创建补贴策略
-    print(f"\n创建 {args.n_rounds} 轮补贴策略...")
-    scenarios = create_subsidy_scenarios(args.n_rounds)
-    for i, s in enumerate(scenarios):
-        print(f"  第{i+1}轮: {s.face_value}元{s.discount_type} | "
-              f"满{s.threshold:.0f} | {s.category} | {s.expire_days}天有效")
-
-    # 执行仿真
-    print(f"\n开始仿真...")
-    sim_start = time.time()
-
-    result = society.run_simulation(
-        subsidy_policies=scenarios,
-        n_rounds=args.n_rounds
-    )
-
-    sim_time = time.time() - sim_start
-    total_time = time.time() - start_time
-
-    # 输出结果
-    stats = result["overall_stats"]
-    print(f"\n{'='*60}")
-    print("仿真结果")
-    print(f"{'='*60}")
-    print(f"  仿真耗时: {sim_time:.2f}s (总计: {total_time:.2f}s)")
-    print(f"  Agent数量: {result['agent_count']}")
-    print(f"  仿真轮数: {result['n_rounds']}")
-    print(f"  总决策次数: {stats['total_decisions']}")
-    print(f"  整体接受率: {stats['overall_accept_rate']:.2%}")
-    print(f"  总净收益: {stats['total_net_benefit']:.2f}元")
-    print(f"  平均净收益/Agent: {stats['avg_net_benefit_per_agent']:.2f}元")
-    print(f"  补贴成本: {stats['total_subsidy_cost']:.2f}元")
-    print(f"  后端信息: {stats['backend_info']}")
-
-    # 各心理账户接受率
-    print(f"\n  各心理账户接受率:")
-    for acc, rate in stats.get("accept_rate_by_account", {}).items():
-        bar = "█" * int(rate * 30)
-        print(f"    {acc:20s}: {rate:.2%} {bar}")
-
-    # 各轮接受率变化
-    print(f"\n  各轮接受率变化:")
-    for rnd, rate in sorted(stats.get("accept_rate_by_round", {}).items()):
-        bar = "█" * int(rate * 30)
-        policy = scenarios[rnd]
-        print(f"    第{rnd+1}轮 ({policy.face_value}元满{policy.threshold:.0f}): "
-              f"{rate:.2%} {bar}")
-
-    # 推理过程采样
-    print(f"\n  推理过程采样 (每类1个Agent):")
-    sampled = {}
-    for user_id, trajectory in result["trajectories"].items():
-        agent = None
-        for a in society.agents:
-            if a.profile.user_id == user_id:
-                agent = a
-                break
-        if agent and agent.profile.mental_account not in sampled:
-            sampled[agent.profile.mental_account] = trajectory[-1]
-        if len(sampled) >= 4:
-            break
-
-    for account, decision in sampled.items():
-        print(f"\n    [{account}]")
-        print(f"    决策: {'接受' if decision.accept else '拒绝'}")
-        print(f"    推理: {decision.reasoning[:120]}...")
-
-    # 导出DataFrame
-    df = society.get_trajectory_dataframe()
-    print(f"\n  决策轨迹DataFrame: {df.shape[0]}行 x {df.shape[1]}列")
-
-    # 保存结果
-    if args.output:
-        output_path = args.output
-    else:
-        os.makedirs("data/results", exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_path = f"data/results/llm_agent_simulation_{timestamp}.json"
-
-    # 序列化结果
-    output_data = {
-        "config": {
-            "n_agents": args.n_agents,
-            "n_rounds": args.n_rounds,
-            "model": args.model,
-            "temperature": args.temperature,
-            "seed": args.seed,
-            "backend": result["backend_info"]
-        },
-        "overall_stats": {
-            k: v for k, v in stats.items()
-            if not isinstance(v, (dict, list)) or k in ["accept_rate_by_account", "accept_rate_by_round"]
-        },
-        "round_summaries": [
-            {
-                k: v for k, v in summary.items()
-                if k != "subsidy_policy" or isinstance(v, dict)
-            }
-            for summary in result["round_summaries"]
-        ],
-        "agent_count": result["agent_count"],
-        "n_rounds": result["n_rounds"],
-        "simulation_time": sim_time,
-        "total_time": total_time
-    }
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output_data, f, ensure_ascii=False, indent=2)
-
-    print(f"\n  结果已保存到: {output_path}")
-
-    # 同时保存CSV
-    csv_path = output_path.replace(".json", ".csv")
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"  决策轨迹CSV已保存到: {csv_path}")
-
-    return result
-
-
-def run_ab_test(args):
-    """
-    A/B测试：对比不同补贴策略的效果
-
-    测试维度：
-    1. 面值变化: 10, 20, 30元
-    2. 门槛变化: 无门槛, 低门槛, 高门槛
-    3. 品类变化: 通用, 餐饮, 购物
-    """
-    print("=" * 60)
-    print("A/B测试: 补贴策略对比实验")
-    print("=" * 60)
-
-    society = create_agent_society(
-        n_agents=min(args.n_agents, 30),
-        seed=args.seed,
-        model_name=args.model,
-        temperature=args.temperature,
-        verbose=False
-    )
-    society.verbose = False
-
-    # 测试策略
-    test_policies = {
-        "面值10元-无门槛": SubsidyInfo("ab_1", 10, 0, "通用", 7, "满减", subsidy_pool=100000),
-        "面值10元-满50": SubsidyInfo("ab_2", 10, 50, "通用", 7, "满减", subsidy_pool=100000),
-        "面值20元-无门槛": SubsidyInfo("ab_3", 20, 0, "通用", 7, "满减", subsidy_pool=100000),
-        "面值20元-满80": SubsidyInfo("ab_4", 20, 80, "通用", 7, "满减", subsidy_pool=100000),
-        "面值30元-无门槛": SubsidyInfo("ab_5", 30, 0, "通用", 7, "满减", subsidy_pool=100000),
-        "面值30元-满120": SubsidyInfo("ab_6", 30, 120, "通用", 7, "满减", subsidy_pool=100000),
-        "品类-餐饮": SubsidyInfo("ab_7", 20, 50, "餐饮", 7, "满减", subsidy_pool=100000),
-        "品类-购物": SubsidyInfo("ab_8", 20, 50, "购物", 7, "满减", subsidy_pool=100000),
-    }
-
-    results = {}
-    for name, policy in test_policies.items():
-        policy.agent_count = len(society.agents)
-        policy.per_capita = policy.subsidy_pool / max(len(society.agents), 1)
-
-        decisions = society.run_round(policy, round_num=0, context=None)
-        accept_rate = sum(1 for d in decisions.values() if d.accept) / len(decisions)
-        avg_net = sum(d.net_benefit for d in decisions.values()) / len(decisions)
-        avg_spend = sum(d.expected_spend for d in decisions.values()) / len(decisions)
-
-        results[name] = {
-            "accept_rate": accept_rate,
-            "avg_net_benefit": avg_net,
-            "avg_expected_spend": avg_spend
-        }
-
-    # 打印结果
-    print(f"\n{'策略':<20s} {'接受率':>8s} {'平均净收益':>10s} {'平均消费':>10s}")
-    print("-" * 52)
-    for name, metrics in results.items():
-        print(f"{name:<20s} {metrics['accept_rate']:>7.2%} "
-              f"{metrics['avg_net_benefit']:>9.2f}元 "
-              f"{metrics['avg_expected_spend']:>9.2f}元")
-
-    # 分析
-    print(f"\n{'='*60}")
-    print("A/B测试分析")
-    print(f"{'='*60}")
-
-    # 面值效果
-    print("\n面值效果分析:")
-    for face_value in [10, 20, 30]:
-        no_threshold = results.get(f"面值{face_value}元-无门槛", {}).get("accept_rate", 0)
-        with_threshold = results.get(f"面值{face_value}元-满{int(face_value*2.5 if face_value==10 else face_value*4)}", {}).get("accept_rate", 0)
-        print(f"  {face_value}元: 无门槛 {no_threshold:.2%} | 有门槛 {with_threshold:.2%}")
-
-    # 品类效果
-    print("\n品类效果分析:")
-    for cat_name in ["品类-餐饮", "品类-购物"]:
-        rate = results.get(cat_name, {}).get("accept_rate", 0)
-        print(f"  {cat_name}: {rate:.2%}")
-
-    return results
-
+# ===========================================================================
+# 主函数
+# ===========================================================================
 
 def main():
-    """主函数"""
     args = parse_args()
 
-    print("=" * 60)
-    print("LLM Agent 补贴仿真系统")
-    print("基于大语言模型的消费者行为仿真")
-    print("=" * 60)
-    print()
-
-    # 演示模式
+    # 演示模式：使用内置 demo 函数
     if args.demo:
-        from src.simulation.llm_agent import demo
-        demo()
+        print("=" * 60)
+        print("LLM Agent 仿真 — 演示模式")
+        print("=" * 60)
+        result = run_llm_simulation(
+            n_agents=5,
+            n_rounds=2,
+            use_mock=True,
+        )
+        print("\n演示完成。")
         return
 
     # 环境检查
     mode = check_environment()
 
-    # 单Agent测试
-    run_single_agent_test(args)
+    # 确定后端
+    backend = args.backend
+    if backend is None:
+        if os.environ.get("OPENAI_API_KEY"):
+            backend = "openai"
+        elif os.environ.get("ANTHROPIC_API_KEY"):
+            backend = "anthropic"
+        else:
+            backend = "mock"
 
-    print("\n")
+    api_key = None
+    if backend == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+    elif backend == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    llm_client = LLMClient(backend=backend, api_key=api_key)
+
+    # 单 Agent 测试
+    run_single_agent_test(args, llm_client)
+    print()
 
     # 完整仿真
-    run_full_simulation(args)
+    run_full_simulation(args, llm_client)
 
-    print("\n")
-
-    # A/B测试
-    run_ab_test(args)
-
-    print(f"\n{'='*60}")
+    print("=" * 60)
     print("所有实验完成！")
-    print(f"{'='*60}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
