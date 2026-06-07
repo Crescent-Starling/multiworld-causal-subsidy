@@ -12,7 +12,7 @@
 - **Causal Inference Pipeline** — CausalML (T/X/DR/S-Learner) + DoWhy (causal graph + refutation) for rigorous treatment effect estimation
 - **Theory-Driven AI Agents** — Mesa ABM with Prospect Theory (Kahneman & Tversky, 1979) and Mental Accounting (Thaler, 1985) agents, beyond ad-hoc heuristics
 - **Social Network Contagion** — NetworkX-powered SIR contagion modeling for spillover effect estimation
-- **Meituan Real-World Data** — Validated on 100K+ users and 2.3M+ coupon records from the Meituan competition dataset (anonymized)
+- **Meituan Real-World Data** — Validated on ~490K users and 6.8M+ behavior events from the Meituan competition dataset (anonymized)
 
 ## Background
 
@@ -28,10 +28,11 @@ Building upon the competition work, this repository presents a **complete redesi
 ## Data Source
 
 The data used in this project comes from the **Meituan competition dataset** (publicly available, anonymized).
-- **User profile data**: 100,000 users (anonymized)
-- **Behavior sequence data**: User activity logs
-- **Order data**: 315,000+ transaction records
-- **Coupon data**: 2,312,000+ coupon records
+- **User behavior events** (`view_data.csv`): 6.8M+ event records from ~490K users (page views, clicks, POI visits)
+- **Coupon order samples** (`神券订单数据样例.xlsx`): 950 order records with coupon type, subsidy amount, and POI category
+- **User behavior sequences** (`用户行为序列.xlsx`): Session-level behavior sequences for 8 sampled users
+- **Keemat order data** (`①Keemat_order_info`): 207K order-line records from ~13K users
+- **Keemat exposure data** (`②Keemat_exposure_info`): 101K SKU-level exposure records
 
 > **Note**: All data has been anonymized by Meituan. This project uses the data for research and educational purposes only.
 
