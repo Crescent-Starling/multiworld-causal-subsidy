@@ -350,6 +350,8 @@ class SubsidyModel(Model):
 
         # 创建Agent
         self._create_agents(user_profiles, agent_configs)
+        # 同步实际Agent数量（user_profiles行数可能 < n_agents）
+        self.n_agents = len(list(self.agents))
 
     def _create_agents(
         self,
@@ -413,11 +415,12 @@ class SubsidyModel(Model):
         agents_list = list(self.agents)
 
         if self.strategy == StrategyType.RANDOM:
-            indices = self.rng.choice(self.n_agents, n_to_subsidize, replace=False)
-            selected_ids = set(indices.tolist())
-            for agent in agents_list:
-                if agent.agent_id in selected_ids:
-                    agent.receive_subsidy(self.subsidy_amount)
+            # 使用实际Agent数量采样，避免agent_id与索引不一致
+            n_actual = len(agents_list)
+            n_sub = min(int(n_actual * self.budget_ratio), n_actual)
+            selected_indices = self.rng.choice(n_actual, n_sub, replace=False)
+            for idx in selected_indices:
+                agents_list[idx].receive_subsidy(self.subsidy_amount)
 
         elif self.strategy == StrategyType.STATIC:
             # 按价格敏感度降序排列，补贴最敏感的用户
@@ -474,11 +477,21 @@ class SubsidyModel(Model):
                 """CATE策略评分：使用预估计的CATE/uplift值排序"""
                 return self.cate_scores.get(a.agent_id, 0.0)
 
-            agents_list.sort(key=cate_score, reverse=True)
-            for agent in agents_list[:n_to_subsidize]:
-                # CATE越大→补贴效率越高→金额可适当降低（避免过度补贴高响应者）
+            # 仅对正uplift用户补贴——负或零uplift意味着补贴不会带来正向增量
+            positive_cate_agents = [
+                a for a in agents_list
+                if self.cate_scores.get(a.agent_id, 0.0) > 0
+            ]
+            positive_cate_agents.sort(key=cate_score, reverse=True)
+
+            # 补贴人数：不超过预算覆盖、不超过正uplift用户数（允许预算节余）
+            n_subsidize = min(n_to_subsidize, len(positive_cate_agents))
+
+            for agent in positive_cate_agents[:n_subsidize]:
+                # CATE越大→补贴效率越高→金额可适当降低（效率优先，节省预算）
                 cate_val = self.cate_scores.get(agent.agent_id, 0.0)
-                cate_norm = min(cate_val / max(max(self.cate_scores.values(), default=1.0), 1e-6), 1.0)
+                cate_max = max(self.cate_scores.values(), default=1.0)
+                cate_norm = min(cate_val / max(cate_max, 1e-6), 1.0)
                 # 高CATE用户少给（他们本身就响应强），低CATE用户给标准金额（试探）
                 amount = self.subsidy_amount * (1.1 - 0.3 * cate_norm)
                 agent.receive_subsidy(max(amount, 5.0))
@@ -761,6 +774,9 @@ class MultiWorldModel:
         """
         if strategies is None:
             strategies = ["random", "static", "dynamic", "cognitive"]
+
+        # 重置：避免跨调用累积旧数据
+        self._mc_results = {}
 
         for i in range(n_seeds):
             seed = self.seed + i * 1000
