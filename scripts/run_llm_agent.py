@@ -11,9 +11,10 @@ LLM Agent 补贴仿真运行脚本
     python scripts/run_llm_agent.py --backend openai --model gpt-4o-mini
 
 环境变量：
-    OPENAI_API_KEY:   OpenAI API 密钥
+    OPENAI_API_KEY:    OpenAI API 密钥
+    DEEPSEEK_API_KEY: DeepSeek API 密钥（OpenAI 兼容格式）
     ANTHROPIC_API_KEY: Anthropic API 密钥
-    LLM_BACKEND:       强制指定后端 (openai / anthropic / mock)
+    LLM_BACKEND:       强制指定后端 (openai / deepseek / anthropic / mock)
 
 参考文献：
 - Park et al. (2023): Generative Agents
@@ -56,22 +57,26 @@ def check_environment() -> str:
     print("=" * 60)
 
     has_openai_key = bool(os.environ.get("OPENAI_API_KEY"))
+    has_deepseek_key = bool(os.environ.get("DEEPSEEK_API_KEY"))
     has_anthropic_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     backend_env = os.environ.get("LLM_BACKEND", "").strip()
 
     env_status = {
         "OPENAI_API_KEY": "已设置" if has_openai_key else "未设置",
+        "DEEPSEEK_API_KEY": "已设置" if has_deepseek_key else "未设置",
         "ANTHROPIC_API_KEY": "已设置" if has_anthropic_key else "未设置",
         "LLM_BACKEND (env override)": backend_env if backend_env else "未设置 (自动选择)",
     }
 
     for key, value in env_status.items():
-        icon = "+" if ("已设置" in value or value == "openai" or value == "anthropic") else "-"
+        icon = "+" if ("已设置" in value or value in ("openai", "deepseek", "anthropic")) else "-"
         print(f"  [{icon}] {key}: {value}")
 
     # 确定运行模式
     if backend_env == "openai" or (not backend_env and has_openai_key):
         mode = "OpenAI API (真实 LLM)"
+    elif backend_env == "deepseek" or (not backend_env and has_deepseek_key):
+        mode = "DeepSeek API (真实 LLM)"
     elif backend_env == "anthropic" or (not backend_env and has_anthropic_key):
         mode = "Anthropic API (真实 LLM)"
     else:
@@ -262,12 +267,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend", type=str, default=None,
-        choices=["openai", "anthropic", "mock"],
+        choices=["openai", "deepseek", "anthropic", "mock"],
         help="强制指定 LLM 后端 (默认: 自动选择)"
     )
     parser.add_argument(
         "--model", type=str, default=None,
-        help="LLM 模型名称 (默认: gpt-4o-mini / claude-3-haiku)"
+        help="LLM 模型名称 (OpenAI: gpt-4o-mini; DeepSeek: deepseek-chat / deepseek-reasoner)"
+    )
+    parser.add_argument(
+        "--base-url", type=str, default=None,
+        help="自定义 API base URL (DeepSeek 默认: https://api.deepseek.com/v1)"
     )
     parser.add_argument(
         "--base-subsidy", type=float, default=10.0,
@@ -336,18 +345,34 @@ def main():
     if backend is None:
         if os.environ.get("OPENAI_API_KEY"):
             backend = "openai"
+        elif os.environ.get("DEEPSEEK_API_KEY"):
+            backend = "deepseek"
         elif os.environ.get("ANTHROPIC_API_KEY"):
             backend = "anthropic"
         else:
             backend = "mock"
 
     api_key = None
+    base_url = args.base_url
+    model = args.model
+
     if backend == "openai":
         api_key = os.environ.get("OPENAI_API_KEY")
+        model = model or "gpt-4o-mini"
+    elif backend == "deepseek":
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        model = model or "deepseek-chat"
+        base_url = base_url or "https://api.deepseek.com/v1"
     elif backend == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
+        model = model or "claude-3-haiku-20240307"
 
-    llm_client = LLMClient(backend=backend, api_key=api_key)
+    llm_client = LLMClient(
+        backend=backend,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+    )
 
     # 单 Agent 测试
     run_single_agent_test(args, llm_client)

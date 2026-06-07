@@ -1,5 +1,10 @@
 # AI Subsidy Simulation - Git Ignore
 
+# Environment variables (API keys etc.)
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]

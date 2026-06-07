@@ -120,17 +120,57 @@ class PromptTemplate:
 # ===========================================================================
 
 class LLMClient:
-    """LLM API客户端，支持多种后端"""
+    """
+    LLM API 客户端，支持多种后端
 
-    def __init__(self, backend: str = "mock", api_key: Optional[str] = None):
+    支持后端：
+    - "openai": OpenAI API (gpt-4o 等), 需 API Key
+    - "anthropic": Anthropic API (Claude 等), 需 API Key
+    - "deepseek": DeepSeek API (OpenAI 兼容格式), 需 DEEPSEEK_API_KEY
+    - "mock": 规则回退模式，无需任何 Key
+    """
+
+    # DeepSeek OpenAI 兼容端点的默认 base_url
+    DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+    def __init__(
+        self,
+        backend: str = "mock",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "gpt-4o-mini",
+    ):
+        """
+        Args:
+            backend: "openai" | "anthropic" | "deepseek" | "mock"
+            api_key: API 密钥（OpenAI / Anthropic / DeepSeek 对应 Key）
+            base_url: 自定义 API 端点的 base URL（覆盖默认值）
+            model: 默认模型名称（供 _call_openai / _call_deepseek 使用）
+        """
         self.backend = backend
         self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
         self.client = None
 
         if backend == "openai" and api_key:
             try:
                 from openai import OpenAI
-                self.client = OpenAI(api_key=api_key)
+                self.client = OpenAI(api_key=api_key, base_url=base_url)
+            except ImportError:
+                print("Warning: openai package not installed, falling back to mock")
+                self.backend = "mock"
+
+        elif backend == "deepseek" and api_key:
+            try:
+                from openai import OpenAI
+                # DeepSeek 使用 OpenAI 兼容格式
+                # 支持的模型：deepseek-v4-pro / deepseek-v4-flash / deepseek-chat / deepseek-reasoner
+                effective_base_url = base_url or self.DEEPSEEK_BASE_URL
+                self.client = OpenAI(api_key=api_key, base_url=effective_base_url)
+                # 设置默认模型（如未显式指定）
+                if not self.model or self.model == "gpt-4o-mini":
+                    self.model = "deepseek-v4-flash"
             except ImportError:
                 print("Warning: openai package not installed, falling back to mock")
                 self.backend = "mock"
@@ -147,15 +187,17 @@ class LLMClient:
         """调用LLM"""
         if self.backend == "openai" and self.client:
             return self._call_openai(system_prompt, user_prompt)
+        elif self.backend == "deepseek" and self.client:
+            return self._call_deepseek(system_prompt, user_prompt)
         elif self.backend == "anthropic" and self.client:
             return self._call_anthropic(system_prompt, user_prompt)
         else:
             return self._call_mock(system_prompt, user_prompt)
 
     def _call_openai(self, system_prompt: str, user_prompt: str) -> str:
-        """调用OpenAI API"""
+        """调用 OpenAI / DeepSeek (OpenAI 兼容) API"""
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -164,6 +206,10 @@ class LLMClient:
             max_tokens=500,
         )
         return response.choices[0].message.content
+
+    def _call_deepseek(self, system_prompt: str, user_prompt: str) -> str:
+        """调用 DeepSeek API (OpenAI 兼容格式)"""
+        return self._call_openai(system_prompt, user_prompt)
 
     def _call_anthropic(self, system_prompt: str, user_prompt: str) -> str:
         """调用Anthropic API"""
@@ -245,13 +291,14 @@ class LLMSubsidyAgent:
         income_level: int = 3,
         consumption_freq: int = 5,
         llm_client: Optional[LLMClient] = None,
+        model: str = "gpt-4o-mini",
     ):
         self.agent_id = agent_id
         self.mental_account = mental_account
         self.price_sensitivity = price_sensitivity
         self.income_level = income_level
         self.consumption_freq = consumption_freq
-        self.llm = llm_client or LLMClient(backend="mock")
+        self.llm = llm_client or LLMClient(backend="mock", model=model)
 
         # 内部状态
         self.fatigue = 0.0
@@ -302,6 +349,7 @@ class LLMSubsidyAgent:
         # 记录轨迹
         self.trajectory.append({
             "agent_id": self.agent_id,
+            "mental_account": self.mental_account,
             "subsidy_amount": subsidy_amount,
             "threshold": threshold,
             "redeemed": result["redeemed"],
@@ -362,6 +410,8 @@ class LLMAgentSociety:
         use_mock: bool = True,
         backend: str = "mock",
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "gpt-4o-mini",
         seed: int = 42,
     ):
         np.random.seed(seed)
@@ -372,7 +422,12 @@ class LLMAgentSociety:
 
         # 创建LLM客户端
         if not use_mock and api_key:
-            self.llm = LLMClient(backend=backend, api_key=api_key)
+            self.llm = LLMClient(
+                backend=backend,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+            )
         else:
             self.llm = LLMClient(backend="mock")
 
