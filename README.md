@@ -1,6 +1,18 @@
-# AI Subsidy Simulation System
+# MultiWorld Causal Subsidy
 
-> A simulation sandbox for subsidy policy evaluation using causal inference and agent-based modeling.
+> Causal inference + AI-driven simulation for coupon subsidy policy evaluation. Originated from the 6th Meituan Business Analysis Elite Competition, this project combines multi-world evaluation, uplift modeling, and behavioral-economics-grounded agent simulation for robust offline policy optimization.
+
+**简体中文**：基于因果推断与AI仿真的优惠券补贴策略评估系统。起源于第六届美团商务分析精英大赛，集成多平行世界评估框架、Uplift 建模与行为经济学驱动的 Agent 仿真，支持鲁棒的离线策略优化。
+
+---
+
+## Highlights
+
+- **Multi-World Evaluation** — Parallel simulation worlds with different subsidy strategies, enabling robust counterfactual comparison and risk quantification
+- **Causal Inference Pipeline** — CausalML (T/X/DR/S-Learner) + DoWhy (causal graph + refutation) for rigorous treatment effect estimation
+- **Theory-Driven AI Agents** — Mesa ABM with Prospect Theory (Kahneman & Tversky, 1979) and Mental Accounting (Thaler, 1985) agents, beyond ad-hoc heuristics
+- **Social Network Contagion** — NetworkX-powered SIR contagion modeling for spillover effect estimation
+- **Meituan Real-World Data** — Validated on 100K+ users and 2.3M+ coupon records from the Meituan competition dataset (anonymized)
 
 ## Background
 
@@ -9,12 +21,13 @@ This project originated from the **6th Meituan Business Analysis Elite Competiti
 Building upon the competition work, this repository presents a **complete redesign** with advanced frameworks:
 - **Causal Inference**: CausalML (Uber) + DoWhy (Microsoft) for robust effect estimation
 - **Agent-Based Modeling**: Mesa framework for formal ABM architecture
-- **Behavioral Economics**: Prospect theory + Mental accounting (Phase 1 completed)
+- **Behavioral Economics**: Prospect theory + Mental accounting + Bounded rationality
+- **Network Effects**: Social contagion via NetworkX
 - **LLM Agent**: AgentSociety (Tsinghua) for LLM-native simulation
 
 ## Data Source
 
-The data used in this project comes from the **Meituan competition dataset** (publicly available, anonymized). 
+The data used in this project comes from the **Meituan competition dataset** (publicly available, anonymized).
 - **User profile data**: 100,000 users (anonymized)
 - **Behavior sequence data**: User activity logs
 - **Order data**: 315,000+ transaction records
@@ -27,20 +40,18 @@ For reproducibility, we also provide **synthetically generated data** (see `data
 ## Tech Stack
 
 ### Causal Inference
-- `causalml` (Uber): Industrial-grade Uplift modeling
+- `causalml` (Uber): Industrial-grade Uplift modeling (T/X/DR/S-Learner)
 - `dowhy` (Microsoft): Causal graph + refutation
-- Custom implementation: T/X/DR-Learner, G-Net, MSM
+- Custom implementation: G-Net, MSM, PSM
 
-### ABM Simulation
-- `mesa`: Formal ABM framework
-- `networkx`: Social network modeling
-
-### LLM Agent
+### AI Simulation
+- `mesa`: Formal ABM framework with theory-driven cognitive agents
+- `networkx`: Social network modeling + contagion
 - `agentsociety` (Tsinghua): LLM-native ABM (planned)
 
 ### Evaluation
-- Bootstrap CI
-- PoliSim PN/PS causal probability (planned)
+- Bootstrap CI, E-value sensitivity analysis
+- Multi-world robustness comparison
 
 ## Project Structure
 
@@ -50,18 +61,18 @@ src/
 │   ├── causalml_wrapper.py
 │   ├── dowhy_causal_graph.py
 │   └── psm_matcher.py
-├── simulation/        # ABM simulation
+├── simulation/        # AI-driven ABM simulation
 │   ├── mesa_agent_model.py
 │   ├── network_contagion.py
-│   └── cognitive_agent_theory.py
+│   ├── cognitive_agent_theory.py
+│   └── llm_agent.py
 ├── evaluation/        # Evaluation metrics
-│   ├── causal_sim_eval.py
-│   └── multi_world_robustness.py
+│   └── metrics.py
 └── features/          # Feature engineering
 
 scripts/               # Run scripts
 docs/                  # Documentation
-data/                  # Data (competition + synthetic)
+data/                  # Data (Meituan anonymized + synthetic)
 ```
 
 ## Quick Start
@@ -69,6 +80,9 @@ data/                  # Data (competition + synthetic)
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+
+# Run all demos
+python scripts/run_all_demos.py
 
 # Run causal inference comparison
 python scripts/run_causalml_comparison.py
