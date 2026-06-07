@@ -57,6 +57,7 @@ class SimulationResult:
     final_metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        """转换为可序列化的字典"""
         return {
             "strategy": self.strategy.value,
             "round_metrics": self.round_metrics,
@@ -375,6 +376,7 @@ class SubsidyModel(Model):
         elif self.strategy == StrategyType.DYNAMIC:
             # 综合评分 = 价格敏感度 × (1 - 疲劳/5) + 城市等级因子
             def dynamic_score(a):
+                """动态策略评分：综合考虑价格敏感度、疲劳度和城市等级"""
                 city_factor = (5 - a.city_tier) / 4.0 * 0.2
                 return a.price_sensitivity * (1.0 - a.fatigue / 5.0) + city_factor
             agents_list.sort(key=dynamic_score, reverse=True)
@@ -386,6 +388,7 @@ class SubsidyModel(Model):
         elif self.strategy == StrategyType.COGNITIVE:
             # 认知理论驱动：前景理论边际价值 × 有限理性 × 疲劳折扣 + 心理账户加成
             def cognitive_score(a):
+                """认知策略评分：前景理论折扣 × 有限理性 × 疲劳衰减 + 心理账户加成"""
                 pv = prospect_discount(
                     subsidy=self.subsidy_amount,
                     reference=a.reference_point,

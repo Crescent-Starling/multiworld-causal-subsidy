@@ -275,7 +275,7 @@ class CausalMLWrapper:
 
 def run_causalml_comparison(
     data_path: str = "data/synthetic/synthetic_data.csv",
-    learner_types: list[str] = ["tlearner", "xlearner", "drlearner"],
+    learner_types: Optional[list[str]] = None,
     feature_cols: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
@@ -291,7 +291,10 @@ def run_causalml_comparison(
     """
     # 加载数据
     df = pd.read_csv(data_path)
-    
+
+    if learner_types is None:
+        learner_types = ["tlearner", "xlearner", "drlearner"]
+
     # 如果没有指定特征列，则使用所有非处理、非结果的列
     if feature_cols is None:
         exclude_cols = ["treatment", "outcome", "cate_existing", "cate_causalml"]
