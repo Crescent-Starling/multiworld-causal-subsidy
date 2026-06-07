@@ -90,7 +90,11 @@ def run_causal_inference_demo(causal_data: pd.DataFrame, verbose: bool = True) -
         if verbose:
             print(f"  PSM ATE = {psm_ate:.4f} (true=2.0)")
             if matcher.match_quality:
-                print(f"  Match quality: SMD={matcher.match_quality.get('smd_matched', 'N/A'):.4f}")
+                smd_max = matcher.match_quality.get('smd_matched_max', 'N/A')
+                smd_mean = matcher.match_quality.get('smd_matched_mean', 'N/A')
+                smd_max_str = f"{smd_max:.4f}" if isinstance(smd_max, float) else str(smd_max)
+                smd_mean_str = f"{smd_mean:.4f}" if isinstance(smd_mean, float) else str(smd_mean)
+                print(f"  Match quality: SMD_max={smd_max_str}, SMD_mean={smd_mean_str}")
     except Exception as e:
         if verbose:
             print(f"  PSM FAILED: {e}")

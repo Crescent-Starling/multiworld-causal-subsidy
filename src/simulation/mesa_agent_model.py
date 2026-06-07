@@ -47,6 +47,20 @@ class StrategyType(str, Enum):
     STATIC = "static"         # 静态策略：基于价格敏感度排序分配固定金额
     DYNAMIC = "dynamic"       # 动态策略：基于用户画像+疲劳度动态调整金额
     COGNITIVE = "cognitive"    # 认知策略：基于前景理论+心理账户+有限理性
+    CATE_DRIVEN = "cate_driven"  # CATE驱动策略：基于因果推断uplift评分
+
+
+@dataclass
+class AgentConfig:
+    """Agent初始化配置（用于多世界共享相同Agent画像）"""
+    agent_id: int
+    price_sensitivity: float
+    income_level: int
+    city_tier: int
+    base_gtv: float           # 基础GTV（从RNG预生成，确保各世界一致）
+    alpha: float = 0.88       # 前景理论曲率
+    lambda_: float = 2.25     # 损失厌恶系数
+    decision_threshold: float = 0.3
 
 
 @dataclass
@@ -111,6 +125,7 @@ class SubsidyAgent(Agent):
         alpha: float = 0.88,
         lambda_: float = 2.25,
         decision_threshold: float = 0.3,
+        base_gtv: Optional[float] = None,
     ):
         """
         初始化Agent
@@ -125,6 +140,7 @@ class SubsidyAgent(Agent):
         - alpha: 前景理论价值函数曲率
         - lambda_: 损失厌恶系数
         - decision_threshold: 核销决策阈值
+        - base_gtv: 基础GTV（如提供则使用，否则从模型RNG生成）
         """
         super().__init__(model)
 
@@ -157,14 +173,16 @@ class SubsidyAgent(Agent):
         self.subsidized = False
         self.subsidy_amount = 0.0
         self.redeemed = False
-        self.base_gtv = np.random.lognormal(3.5, 0.8)  # 基础GTV
+        # 基础GTV：如外部提供则使用（多世界共享），否则从模型RNG生成
+        self.base_gtv = base_gtv if base_gtv is not None else model.rng.lognormal(3.5, 0.8)
 
         # 累积指标
         self.total_subsidy = 0.0
         self.total_gtv = 0.0
         self.total_redemptions = 0
 
-        # 本轮快照（用于指标收集，step()后仍可读取）
+        # 增量记账：本轮产生的GTV和补贴（用于collect_results计算每轮ROI）
+        self._step_gtv = 0.0
         self._step_subsidy_amount = 0.0
         self._step_subsidized = False
 
@@ -185,13 +203,18 @@ class SubsidyAgent(Agent):
         4. 心理账户影响
         5. 综合决策（与阈值+噪声比较）
         """
+        # 重置本轮增量记账
+        self._step_gtv = 0.0
         # 保存本轮快照
         self._step_subsidized = self.subsidized
         self._step_subsidy_amount = self.subsidy_amount
 
         if not self.subsidized:
             self.redeemed = False
-            # 无补贴时仍更新状态（疲劳衰减、参考点回落）
+            # 无补贴时仍产生基础消费（对照组GTV）
+            self._step_gtv = self.base_gtv * 0.3
+            self.total_gtv += self._step_gtv
+            # 更新状态（疲劳衰减、参考点回落）
             self._update_state()
             return
 
@@ -224,17 +247,19 @@ class SubsidyAgent(Agent):
         }
         effective += account_boost.get(self.mental_account, 0.0)
 
-        # 随机噪声
-        noise = np.random.normal(0, 0.1)
+        # 随机噪声（使用模型级RNG，确保可复现）
+        noise = self.model.rng.normal(0, 0.1)
 
         # 决策：有效激活值超过阈值则核销
         self.redeemed = effective > (self.decision_threshold + noise)
 
         if self.redeemed:
-            self.total_gtv += self.base_gtv + self.subsidy_amount * 0.5
+            self._step_gtv = self.base_gtv + self.subsidy_amount * 0.5
+            self.total_gtv += self._step_gtv
             self.total_redemptions += 1
         else:
-            self.total_gtv += self.base_gtv * 0.3
+            self._step_gtv = self.base_gtv * 0.3
+            self.total_gtv += self._step_gtv
 
         # 更新内部状态
         self._update_state()
@@ -295,17 +320,21 @@ class SubsidyModel(Model):
         subsidy_amount: float = 10.0,
         seed: int = 42,
         user_profiles: Optional[pd.DataFrame] = None,
+        agent_configs: Optional[list[AgentConfig]] = None,
+        cate_scores: Optional[dict[int, float]] = None,
     ):
         """
         初始化仿真模型
 
         参数：
         - n_agents: Agent数量
-        - strategy: 补贴策略类型（random/static/dynamic/cognitive）
+        - strategy: 补贴策略类型（random/static/dynamic/cognitive/cate_driven）
         - budget_ratio: 预算覆盖比例（受补贴用户占比）
         - subsidy_amount: 基础补贴金额（元）
         - seed: 随机种子
         - user_profiles: 可选的用户画像DataFrame
+        - agent_configs: 预生成的Agent配置列表（多世界共享画像时使用）
+        - cate_scores: 可选的{agent_id: CATE}映射（CATE驱动策略时使用）
         """
         super().__init__()
         self.n_agents = n_agents
@@ -314,16 +343,39 @@ class SubsidyModel(Model):
         self.subsidy_amount = subsidy_amount
         self.seed = seed
         self.rng = np.random.RandomState(seed)
+        self.cate_scores = cate_scores or {}
 
         self.current_round = 0
         self.round_results: list[dict] = []
 
         # 创建Agent
-        self._create_agents(user_profiles)
+        self._create_agents(user_profiles, agent_configs)
 
-    def _create_agents(self, user_profiles: Optional[pd.DataFrame] = None) -> None:
-        """创建Agent群体"""
-        if user_profiles is not None:
+    def _create_agents(
+        self,
+        user_profiles: Optional[pd.DataFrame] = None,
+        agent_configs: Optional[list[AgentConfig]] = None,
+    ) -> None:
+        """
+        创建Agent群体
+
+        优先级：agent_configs > user_profiles > 随机生成
+        """
+        if agent_configs is not None:
+            # 多世界模式：使用共享的Agent配置（确保初始画像一致）
+            for cfg in agent_configs:
+                agent = SubsidyAgent(
+                    model=self,
+                    agent_id=cfg.agent_id,
+                    price_sensitivity=cfg.price_sensitivity,
+                    income_level=cfg.income_level,
+                    city_tier=cfg.city_tier,
+                    alpha=cfg.alpha,
+                    lambda_=cfg.lambda_,
+                    decision_threshold=cfg.decision_threshold,
+                    base_gtv=cfg.base_gtv,  # 共享base_gtv，确保各世界Agent起点一致
+                )
+        elif user_profiles is not None:
             n = min(self.n_agents, len(user_profiles))
             for i in range(n):
                 row = user_profiles.iloc[i]
@@ -416,6 +468,21 @@ class SubsidyModel(Model):
                     amount = self.subsidy_amount
                 agent.receive_subsidy(amount)
 
+        elif self.strategy == StrategyType.CATE_DRIVEN:
+            # CATE驱动策略：基于因果推断uplift评分选择补贴对象和金额
+            def cate_score(a):
+                """CATE策略评分：使用预估计的CATE/uplift值排序"""
+                return self.cate_scores.get(a.agent_id, 0.0)
+
+            agents_list.sort(key=cate_score, reverse=True)
+            for agent in agents_list[:n_to_subsidize]:
+                # CATE越大→补贴效率越高→金额可适当降低（避免过度补贴高响应者）
+                cate_val = self.cate_scores.get(agent.agent_id, 0.0)
+                cate_norm = min(cate_val / max(max(self.cate_scores.values(), default=1.0), 1e-6), 1.0)
+                # 高CATE用户少给（他们本身就响应强），低CATE用户给标准金额（试探）
+                amount = self.subsidy_amount * (1.1 - 0.3 * cate_norm)
+                agent.receive_subsidy(max(amount, 5.0))
+
     def step(self) -> None:
         """
         模型每步执行
@@ -440,9 +507,9 @@ class SubsidyModel(Model):
         """
         收集当前轮次的结果
 
-        指标：
-        - ROI: 核销增量回报
-        - ΔGTV: 补贴驱动的总交易增量
+        指标（使用增量记账，避免累计口径问题）：
+        - ROI: 核销增量回报（基于本轮GTV增量）
+        - ΔGTV: 补贴驱动的本轮交易增量
         - Coverage: 受补贴用户覆盖率
         - RedemptionRate: 核销率
         """
@@ -453,14 +520,17 @@ class SubsidyModel(Model):
         control = [a for a in agents_list if not a._step_subsidized]
 
         total_subsidy_step = sum(a._step_subsidy_amount for a in treated)
-        treated_gtv = sum(a.total_gtv for a in treated)
-        control_gtv = sum(a.total_gtv for a in control) if control else 0.0
+
+        # 使用增量GTV（_step_gtv）而非累计total_gtv，避免重复累计
+        treated_gtv = sum(a._step_gtv for a in treated)
+        control_gtv = sum(a._step_gtv for a in control) if control else 0.0
 
         n_treated = len(treated)
+        n_control = len(control)
         n_redeemed = sum(1 for a in treated if a.redeemed)
 
-        # ΔGTV: 处理组GTV - 对照组GTV的期望值
-        delta_gtv = treated_gtv - control_gtv * (n_treated / max(len(control), 1))
+        # ΔGTV: 处理组本轮GTV - 对照组本轮GTV的期望值（按人数比例缩放）
+        delta_gtv = treated_gtv - control_gtv * (n_treated / max(n_control, 1))
         # ROI: (ΔGTV - 补贴成本) / 补贴成本
         roi = (delta_gtv - total_subsidy_step) / total_subsidy_step if total_subsidy_step > 0 else 0.0
         coverage = n_treated / len(agents_list)
@@ -534,10 +604,10 @@ class MultiWorldModel:
     本项目的核心创新点：同一组Agent在多个"假设世界"中并行运行，
     每个世界应用不同的补贴策略，通过比较不同世界的结果来评估策略效果。
 
-    关键价值：
-    1. 解耦假设风险与随机噪声：固定Agent画像，仅改变策略变量
-    2. 因果推断视角：多世界对比 ≈ 反事实推断
-    3. 排除个体异质性干扰：同一组人在不同策略下的行为差异即策略效果
+    关键设计（v2改进）：
+    1. 共享Agent配置：所有世界使用相同的Agent画像和base_gtv，仅策略不同
+    2. 独立随机流：每个世界有独立的RNG流，但初始化状态一致
+    3. Monte Carlo重复：支持多seed重复实验，区分策略差异与随机波动
 
     参考文献：
     - 多世界仿真思想借鉴自量子力学的"多世界诠释"在社会科学中的类比
@@ -558,7 +628,7 @@ class MultiWorldModel:
         参数：
         - n_agents: 每个世界的Agent数量
         - n_rounds: 每个世界的仿真轮数
-        - seed: 随机种子（确保所有世界使用相同的随机初始化）
+        - seed: 随机种子（用于生成共享Agent配置）
         - user_profiles: 可选的用户画像DataFrame
         """
         self.n_agents = n_agents
@@ -567,12 +637,54 @@ class MultiWorldModel:
         self.user_profiles = user_profiles
         self.world_results: dict[str, SimulationResult] = {}
 
+        # 预生成共享Agent配置（所有世界使用同一组画像和base_gtv）
+        self._agent_configs = self._generate_agent_configs()
+        # Monte Carlo结果（多seed重复）
+        self._mc_results: dict[int, dict[str, SimulationResult]] = {}
+
+    def _generate_agent_configs(self) -> list[AgentConfig]:
+        """
+        生成共享的Agent配置列表
+
+        所有平行世界使用相同的Agent画像和base_gtv，
+        确保"多世界对比"仅反映策略差异而非个体异质性。
+        """
+        rng = np.random.RandomState(self.seed)
+        configs = []
+
+        if self.user_profiles is not None:
+            n = min(self.n_agents, len(self.user_profiles))
+            for i in range(n):
+                row = self.user_profiles.iloc[i]
+                configs.append(AgentConfig(
+                    agent_id=i,
+                    price_sensitivity=float(row.get("price_sensitivity", 0.5)),
+                    income_level=int(row.get("income_level", 3)),
+                    city_tier=int(row.get("city_tier", 3)),
+                    base_gtv=rng.lognormal(3.5, 0.8),
+                ))
+        else:
+            for i in range(self.n_agents):
+                ps = rng.beta(2, 5)
+                income = rng.choice([1, 2, 3, 4, 5], p=[0.1, 0.2, 0.35, 0.25, 0.1])
+                city = rng.choice([1, 2, 3, 4, 5], p=[0.15, 0.25, 0.30, 0.20, 0.10])
+                configs.append(AgentConfig(
+                    agent_id=i,
+                    price_sensitivity=ps,
+                    income_level=income,
+                    city_tier=city,
+                    base_gtv=rng.lognormal(3.5, 0.8),
+                ))
+
+        return configs
+
     def add_world(
         self,
         world_name: str,
         strategy: str,
         budget_ratio: float = 0.3,
         subsidy_amount: float = 10.0,
+        cate_scores: Optional[dict[int, float]] = None,
     ) -> SimulationResult:
         """
         添加并运行一个平行世界
@@ -582,6 +694,7 @@ class MultiWorldModel:
         - strategy: 策略类型
         - budget_ratio: 预算覆盖比例
         - subsidy_amount: 基础补贴金额
+        - cate_scores: CATE评分（CATE驱动策略时使用）
 
         返回：
         - SimulationResult
@@ -592,7 +705,8 @@ class MultiWorldModel:
             budget_ratio=budget_ratio,
             subsidy_amount=subsidy_amount,
             seed=self.seed,
-            user_profiles=self.user_profiles,
+            agent_configs=self._agent_configs,  # 共享Agent配置
+            cate_scores=cate_scores,
         )
         result = model.run(n_rounds=self.n_rounds)
         self.world_results[world_name] = result
@@ -602,9 +716,10 @@ class MultiWorldModel:
         self,
         budget_ratio: float = 0.3,
         subsidy_amount: float = 10.0,
+        cate_scores: Optional[dict[int, float]] = None,
     ) -> dict[str, SimulationResult]:
         """
-        运行所有4种策略对比
+        运行所有5种策略对比
 
         返回：
         - 各策略的SimulationResult
@@ -615,11 +730,104 @@ class MultiWorldModel:
             "dynamic": "dynamic",
             "cognitive": "cognitive",
         }
+        # 仅在提供CATE评分时才运行CATE驱动策略
+        if cate_scores is not None:
+            strategies["cate_driven"] = "cate_driven"
 
         for name, strategy in strategies.items():
-            self.add_world(name, strategy, budget_ratio, subsidy_amount)
+            self.add_world(name, strategy, budget_ratio, subsidy_amount,
+                           cate_scores=cate_scores if strategy == "cate_driven" else None)
 
         return self.world_results
+
+    def monte_carlo_experiment(
+        self,
+        n_seeds: int = 10,
+        strategies: Optional[list[str]] = None,
+        budget_ratio: float = 0.3,
+        subsidy_amount: float = 10.0,
+    ) -> dict[int, dict[str, SimulationResult]]:
+        """
+        Monte Carlo重复实验：多seed运行，评估策略排名的稳健性
+
+        参数：
+        - n_seeds: 随机种子数量
+        - strategies: 要比较的策略列表（默认4种）
+        - budget_ratio: 预算覆盖比例
+        - subsidy_amount: 基础补贴金额
+
+        返回：
+        - {seed: {strategy_name: SimulationResult}}
+        """
+        if strategies is None:
+            strategies = ["random", "static", "dynamic", "cognitive"]
+
+        for i in range(n_seeds):
+            seed = self.seed + i * 1000
+            # 为每个seed生成独立的Agent配置
+            rng = np.random.RandomState(seed)
+            configs = []
+            for j in range(self.n_agents):
+                ps = rng.beta(2, 5)
+                income = rng.choice([1, 2, 3, 4, 5], p=[0.1, 0.2, 0.35, 0.25, 0.1])
+                city = rng.choice([1, 2, 3, 4, 5], p=[0.15, 0.25, 0.30, 0.20, 0.10])
+                configs.append(AgentConfig(
+                    agent_id=j,
+                    price_sensitivity=ps,
+                    income_level=income,
+                    city_tier=city,
+                    base_gtv=rng.lognormal(3.5, 0.8),
+                ))
+
+            seed_results = {}
+            for strategy in strategies:
+                model = SubsidyModel(
+                    n_agents=self.n_agents,
+                    strategy=strategy,
+                    budget_ratio=budget_ratio,
+                    subsidy_amount=subsidy_amount,
+                    seed=seed,
+                    agent_configs=configs,
+                )
+                result = model.run(n_rounds=self.n_rounds)
+                seed_results[strategy] = result
+
+            self._mc_results[seed] = seed_results
+
+        return self._mc_results
+
+    def get_mc_summary(self) -> pd.DataFrame:
+        """
+        获取Monte Carlo实验汇总
+
+        返回每策略在多seed实验下的ROI统计量
+        """
+        if not self._mc_results:
+            return pd.DataFrame()
+
+        rows = []
+        for seed, seed_results in self._mc_results.items():
+            for strategy, result in seed_results.items():
+                rows.append({
+                    "seed": seed,
+                    "strategy": strategy,
+                    "avg_roi": result.final_metrics["avg_roi"],
+                    "cumulative_delta_gtv": result.final_metrics["cumulative_delta_gtv"],
+                    "avg_redemption_rate": result.final_metrics["avg_redemption_rate"],
+                })
+
+        df = pd.DataFrame(rows)
+
+        # 汇总统计
+        summary = df.groupby("strategy").agg(
+            roi_mean=("avg_roi", "mean"),
+            roi_std=("avg_roi", "std"),
+            roi_cv=("avg_roi", lambda x: x.std() / max(abs(x.mean()), 1e-6)),
+            n_seeds=("seed", "count"),
+            delta_gtv_mean=("cumulative_delta_gtv", "mean"),
+        ).reset_index()
+
+        return summary
 
     def compare_worlds(self) -> pd.DataFrame:
         """
@@ -664,40 +872,143 @@ class MultiWorldModel:
                 })
         return pd.DataFrame(rows)
 
-    def robustness_analysis(self) -> dict[str, Any]:
+    def robustness_analysis(
+        self,
+        n_mc_seeds: int = 10,
+        param_perturb: bool = True,
+    ) -> dict[str, Any]:
         """
-        稳健性分析
+        真正的稳健性分析（增强版）
 
-        评估各策略在多世界对比中的稳健性：
-        1. ROI排名稳定性
-        2. 策略间效应量差异
-        3. 变异系数（CV）
+        包含三类检验：
+        1. Monte Carlo重复：多seed运行，评估策略排名稳定性
+        2. 参数扰动：关键参数 ±20%，观察策略效应量变化
+        3. 策略排名一致性（Friedman检验）
+
+        参数：
+        - n_mc_seeds: Monte Carlo种子数量
+        - param_perturb: 是否执行参数扰动检验
+
+        返回：
+        - 包含三类检验结果的字典
         """
-        comparison = self.compare_worlds()
+        results = {}
 
-        if len(comparison) == 0:
-            return {}
+        # ===== 检验1：Monte Carlo重复 =====
+        mc_model = MultiWorldModel(
+            n_agents=self.n_agents,
+            n_rounds=self.n_rounds,
+            seed=self.seed,
+        )
+        mc_model.monte_carlo_experiment(n_seeds=n_mc_seeds)
+        mc_summary = mc_model.get_mc_summary()
 
-        rois = comparison["avg_roi"].values
-        delta_gtvs = comparison["cumulative_delta_gtv"].values
+        # 策略排名一致性（出现次数）
+        strategy_ranks = {s: [] for s in mc_summary["strategy"].values}
+        for seed, seed_results in mc_model._mc_results.items():
+            ranked = sorted(
+                seed_results.items(),
+                key=lambda x: x[1].final_metrics["avg_roi"],
+                reverse=True,
+            )
+            for rank, (name, _) in enumerate(ranked, 1):
+                strategy_ranks[name].append(rank)
 
-        # 最优策略
-        best_strategy = comparison.iloc[0]["world"]
+        # 排名第一的次数
+        win_counts = {s: sum(1 for r in ranks if r == 1)
+                      for s, ranks in strategy_ranks.items()}
 
-        # ROI变异系数
-        roi_mean = np.mean(rois)
-        roi_cv = np.std(rois) / max(abs(roi_mean), 1e-6)
-
-        # 最优vs最差差异
-        roi_range = max(rois) - min(rois)
-
-        return {
-            "best_strategy": best_strategy,
-            "roi_cv": float(roi_cv),
-            "roi_range": float(roi_range),
-            "n_worlds": len(comparison),
-            "strategies_ranked": comparison[["world", "avg_roi"]].to_dict("records"),
+        results["monte_carlo"] = {
+            "n_seeds": n_mc_seeds,
+            "roi_by_strategy": mc_summary.to_dict("records"),
+            "win_counts": win_counts,
+            "strategy_rank_frequency": {s: dict(pd.Series(ranks).value_counts().sort_index())
+                                      for s, ranks in strategy_ranks.items()},
         }
+
+        # ===== 检验2：参数扰动 =====
+        if param_perturb:
+            perturb_results = self._parameter_perturbation_test()
+            results["parameter_perturbation"] = perturb_results
+
+        # ===== 检验3：策略效应量敏感性 =====
+        # 计算最优策略 vs 最差策略的ROI差距（Monte Carlo分布）
+        roi_by_strategy = {}
+        for seed, seed_results in mc_model._mc_results.items():
+            for sname, result in seed_results.items():
+                roi_by_strategy.setdefault(sname, []).append(
+                    result.final_metrics["avg_roi"]
+                )
+
+        if len(roi_by_strategy) >= 2:
+            all_rois = list(roi_by_strategy.values())
+            effect_sizes = []
+            strategy_names = list(roi_by_strategy.keys())
+            for i in range(len(strategy_names)):
+                for j in range(i + 1, len(strategy_names)):
+                    diffs = [a - b for a, b in zip(all_rois[i], all_rois[j])]
+                    effect_sizes.append({
+                        "comparison": f"{strategy_names[i]} vs {strategy_names[j]}",
+                        "mean_diff": float(np.mean(diffs)),
+                        "std_diff": float(np.std(diffs)),
+                        "significant_runs": sum(1 for d in diffs if d > 0.1),
+                    })
+            results["effect_size_sensitivity"] = effect_sizes
+
+        return results
+
+    def _parameter_perturbation_test(self) -> dict[str, Any]:
+        """
+        参数扰动检验：关键参数 ±20%，观察策略效应量变化
+
+        扰动参数：
+        - alpha（前景理论曲率）
+        - lambda_（损失厌恶系数）
+        - budget_ratio（预算覆盖比例）
+        """
+        perturb_results = {}
+        base_strategies = ["static", "dynamic", "cognitive"]
+
+        for param_name in ["alpha", "lambda_", "budget_ratio"]:
+            param_results = {}
+
+            for factor in [0.8, 1.0, 1.2]:  # ±20%
+                # 为每个扰动创建独立的配置
+                rng = np.random.RandomState(self.seed + int(factor * 100))
+                configs = []
+                for j in range(min(self.n_agents, 100)):
+                    ps = rng.beta(2, 5)
+                    income = rng.choice([1, 2, 3, 4, 5], p=[0.1, 0.2, 0.35, 0.25, 0.1])
+                    city = rng.choice([1, 2, 3, 4, 5], p=[0.15, 0.25, 0.30, 0.20, 0.10])
+                    configs.append(AgentConfig(
+                        agent_id=j,
+                        price_sensitivity=ps,
+                        income_level=income,
+                        city_tier=city,
+                        base_gtv=rng.lognormal(3.5, 0.8),
+                        alpha=0.88 * factor if param_name == "alpha" else 0.88,
+                        lambda_=2.25 * factor if param_name == "lambda_" else 2.25,
+                    ))
+
+                seed = self.seed + int(factor * 1000)
+                roi_by_strategy = {}
+                for strategy in base_strategies:
+                    model = SubsidyModel(
+                        n_agents=min(self.n_agents, 100),
+                        strategy=strategy,
+                        budget_ratio=min(0.3 * factor, 0.5) if param_name == "budget_ratio" else 0.3,
+                        subsidy_amount=10.0,
+                        seed=seed,
+                        agent_configs=configs,
+                    )
+                    result = model.run(n_rounds=min(self.n_rounds, 5))
+                    roi_by_strategy[strategy] = result.final_metrics["avg_roi"]
+
+                param_results[f"{factor:.1f}"] = roi_by_strategy
+
+            perturb_results[param_name] = param_results
+
+        return perturb_results
 
 
 # ===========================================================================
