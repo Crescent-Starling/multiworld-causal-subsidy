@@ -142,7 +142,7 @@ def run_experiment():
     print("\n[2d] POI 共现网络")
     sn_poi = SocialNetwork()
     t0 = time.time()
-    G_poi = sn_poi.build_from_coorcurrence(poi_df, "user_id", "poi_id")
+    G_poi = sn_poi.build_from_cooccurrence(poi_df, "user_id", "poi_id")
     print(f"  耗时: {time.time() - t0:.2f}s")
 
     # ------------------------------------------------------------------

@@ -208,7 +208,7 @@ class SocialNetwork:
     #  基于 POI 共现构建网络
     #  如果两个用户在同一时间段访问了同一 POI，则建立连边
     # -----------------------------------------------------------------------
-    def build_from_coorcurrence(
+    def build_from_cooccurrence(
         self,
         df: pd.DataFrame,
         user_col: str = "user_id",
@@ -547,7 +547,7 @@ class SocialContagion:
         self,
         G: nx.Graph,
         treatment_nodes: list[int],
-        outcome_attr: str = "outcome",
+        outcome_attr: Optional[str] = None,
         n_simulations: int = 100,
         seed: Optional[int] = 42,
     ) -> dict:
@@ -569,8 +569,9 @@ class SocialContagion:
             原始社会网络
         treatment_nodes : list[int]
             处理组节点（种子节点）
-        outcome_attr : str
-            结果属性名（用于标注节点）
+        outcome_attr : str, optional
+            节点结果属性名。若提供，将用该属性标注受影响节点；
+            否则使用 SIR 传播的级联规模作为结果度量
         n_simulations : int
             每种条件下重复模拟次数
         seed : int, optional

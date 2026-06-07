@@ -302,8 +302,46 @@ def save_results(all_results: dict, output_dir: str = "output") -> None:
             pd.DataFrame(rows).to_csv(os.path.join(output_dir, "causal_results.csv"), index=False)
 
     # 保存 ABM 结果
-    if "abm" in all_results and "mesa" in all_results["abm"]:
-        pass  # Mesa 结果已经在内存中
+    if "abm" in all_results:
+        abm = all_results["abm"]
+
+        # Mesa 结果
+        if "mesa" in abm:
+            mesa_rows = [{"metric": k, "value": v} for k, v in abm["mesa"].items()]
+            if mesa_rows:
+                pd.DataFrame(mesa_rows).to_csv(
+                    os.path.join(output_dir, "mesa_results.csv"), index=False
+                )
+
+        # Network 结果
+        if "network" in abm:
+            network_rows = [{"metric": k, "value": v} for k, v in abm["network"].items()]
+            if network_rows:
+                pd.DataFrame(network_rows).to_csv(
+                    os.path.join(output_dir, "network_results.csv"), index=False
+                )
+
+    # 保存 Multi-World 对比结果
+    if "multiworld" in all_results and "comparison" in all_results.get("multiworld", {}):
+        comparison = all_results["multiworld"]["comparison"]
+        if isinstance(comparison, pd.DataFrame):
+            comparison.to_csv(os.path.join(output_dir, "multi_world_comparison.csv"), index=False)
+
+    # 保存理论 Agent 结果
+    if "theory" in all_results:
+        theory_rows = [{"account_type": k, "redemptions": v} for k, v in all_results["theory"].items()]
+        if theory_rows:
+            pd.DataFrame(theory_rows).to_csv(
+                os.path.join(output_dir, "theory_agent_results.csv"), index=False
+            )
+
+    # 保存评估结果
+    if "eval" in all_results:
+        eval_rows = [{"metric": k, "value": str(v)} for k, v in all_results["eval"].items()]
+        if eval_rows:
+            pd.DataFrame(eval_rows).to_csv(
+                os.path.join(output_dir, "evaluation_results.csv"), index=False
+            )
 
     print(f"\nResults saved to {output_dir}/")
 

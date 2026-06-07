@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
+from scipy.optimize import linear_sum_assignment
 
 
 @dataclass
@@ -117,6 +118,8 @@ class PSMMatcher:
             matched_pairs = self._nearest_neighbor_match(treated_idx, control_idx, treated_scores, control_scores)
         elif self.config.method == "caliper":
             matched_pairs = self._caliper_match(treated_idx, control_idx, treated_scores, control_scores)
+        elif self.config.method == "optimal":
+            matched_pairs = self._optimal_match(treated_idx, control_idx, treated_scores, control_scores)
         else:
             raise ValueError(f"Unknown matching method: {self.config.method}")
         
@@ -158,22 +161,57 @@ class PSMMatcher:
         """卡尺匹配（仅匹配得分差异在caliper内的对）"""
         matched_pairs = []
         used_control = set()
-        
+
         for i, (t_idx, t_score) in enumerate(zip(treated_idx, treated_scores)):
             # 找到在caliper内的对照组
             distances = np.abs(control_scores - t_score)
             within_caliper = np.where(distances < self.config.caliper)[0]
-            
+
             if len(within_caliper) > 0:
-                # 选择最接近的且未使用的对照组
-                valid_controls = [control_idx[j] for j in within_caliper if control_idx[j] not in used_control]
-                if len(valid_controls) > 0:
-                    nearest = valid_controls[np.argmin(distances[within_caliper])]
+                # 选择距离最接近的且未使用的对照组
+                valid_mask = np.array([control_idx[j] not in used_control for j in within_caliper])
+                valid_within = within_caliper[valid_mask]
+
+                if len(valid_within) > 0:
+                    # 在有效对照组中选距离最小的
+                    best_j = valid_within[np.argmin(distances[valid_within])]
+                    nearest = control_idx[best_j]
                     matched_pairs.append((t_idx, nearest))
                     used_control.add(nearest)
-        
+
         return matched_pairs
-    
+
+    def _optimal_match(
+        self,
+        treated_idx: np.ndarray,
+        control_idx: np.ndarray,
+        treated_scores: np.ndarray,
+        control_scores: np.ndarray
+    ) -> List[Tuple[int, int]]:
+        """最优匹配（最小化全局倾向得分距离之和）
+
+        使用匈牙利算法（linear_sum_assignment）求解二部图最小权重匹配。
+        适用于处理组和对照组数量不等的情况（取 min(n_treated, n_control) 对）。
+        """
+        # 构建距离矩阵：cost[i, j] = |treated_score[i] - control_score[j]|
+        cost_matrix = np.abs(treated_scores[:, None] - control_scores[None, :])
+
+        # 应用卡尺约束：超出 caliper 的距离设为无穷大
+        if self.config.caliper is not None and self.config.caliper > 0:
+            cost_matrix[cost_matrix > self.config.caliper] = 1e10
+
+        # 匈牙利算法求解最小权重匹配
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        matched_pairs = []
+        for r, c in zip(row_ind, col_ind):
+            # 跳过超出卡尺的匹配
+            if cost_matrix[r, c] >= 1e10:
+                continue
+            matched_pairs.append((treated_idx[r], control_idx[c]))
+
+        return matched_pairs
+
     def _build_matched_dataframe(
         self,
         df: pd.DataFrame,
@@ -196,38 +234,57 @@ class PSMMatcher:
     ) -> Dict[str, Any]:
         """
         评估匹配质量
-        
+
         指标：
-        - SMD（标准化均值差）：< 0.1 表示平衡良好
+        - SMD（标准化均值差）：对所有数值特征计算，< 0.1 表示平衡良好
         - 匹配率：成功匹配的处理组比例
         """
-        # 计算SMD（简化版：只计算第一个特征）
-        feature_col = [col for col in original_df.columns if col != treatment_col][0]
-        
-        treated_original = original_df[original_df[treatment_col] == 1][feature_col].mean()
-        control_original = original_df[original_df[treatment_col] == 0][feature_col].mean()
-        pooled_std_original = np.sqrt(
-            (original_df[original_df[treatment_col] == 1][feature_col].var() +
-             original_df[original_df[treatment_col] == 0][feature_col].var()) / 2
-        )
-        smd_original = (treated_original - control_original) / pooled_std_original
-        
-        treated_matched = matched_df[matched_df[treatment_col] == 1][feature_col].mean()
-        control_matched = matched_df[matched_df[treatment_col] == 0][feature_col].mean()
-        pooled_std_matched = np.sqrt(
-            (matched_df[matched_df[treatment_col] == 1][feature_col].var() +
-             matched_df[matched_df[treatment_col] == 0][feature_col].var()) / 2
-        )
-        smd_matched = (treated_matched - control_matched) / pooled_std_matched
-        
-        match_rate = len(matched_df) / len(original_df)
-        
+        # 获取所有数值型特征列（排除处理变量）
+        numeric_cols = original_df.select_dtypes(include=[np.number]).columns.tolist()
+        feature_cols = [col for col in numeric_cols if col != treatment_col]
+
+        smd_original_list = []
+        smd_matched_list = []
+
+        for col in feature_cols:
+            # 原始数据SMD
+            treated_orig = original_df[original_df[treatment_col] == 1][col]
+            control_orig = original_df[original_df[treatment_col] == 0][col]
+            pooled_std_orig = np.sqrt((treated_orig.var() + control_orig.var()) / 2)
+            if pooled_std_orig > 1e-10:
+                smd_orig = (treated_orig.mean() - control_orig.mean()) / pooled_std_orig
+            else:
+                smd_orig = 0.0
+            smd_original_list.append(abs(smd_orig))
+
+            # 匹配后SMD
+            treated_match = matched_df[matched_df[treatment_col] == 1][col]
+            control_match = matched_df[matched_df[treatment_col] == 0][col]
+            pooled_std_match = np.sqrt((treated_match.var() + control_match.var()) / 2)
+            if pooled_std_match > 1e-10:
+                smd_match = (treated_match.mean() - control_match.mean()) / pooled_std_match
+            else:
+                smd_match = 0.0
+            smd_matched_list.append(abs(smd_match))
+
+        # 报告最大和平均SMD
+        max_smd_original = max(smd_original_list) if smd_original_list else 0.0
+        max_smd_matched = max(smd_matched_list) if smd_matched_list else 0.0
+        mean_smd_original = np.mean(smd_original_list) if smd_original_list else 0.0
+        mean_smd_matched = np.mean(smd_matched_list) if smd_matched_list else 0.0
+
+        match_rate = len(matched_df) / max(len(original_df), 1)
+
         return {
-            "smd_original": smd_original,
-            "smd_matched": smd_matched,
+            "smd_original_max": max_smd_original,
+            "smd_original_mean": mean_smd_original,
+            "smd_matched_max": max_smd_matched,
+            "smd_matched_mean": mean_smd_matched,
+            "smd_by_feature_original": dict(zip(feature_cols, smd_original_list)),
+            "smd_by_feature_matched": dict(zip(feature_cols, smd_matched_list)),
             "match_rate": match_rate,
             "n_matched_pairs": len(matched_df) // 2,
-            "balanced": abs(smd_matched) < 0.1  # SMD < 0.1 表示平衡
+            "balanced": max_smd_matched < 0.1,  # 最大SMD < 0.1 表示平衡
         }
     
     def estimate_ate_after_matching(self, matched_df: pd.DataFrame, outcome_col: str, treatment_col: str) -> float:
