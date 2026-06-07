@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multiworld-causal-subsidy"
+version = "1.0.0"
+description = "Causal inference + AI-driven simulation for coupon subsidy policy evaluation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Crescent-Starling", email = "3325754464@qq.com"},
+]
+keywords = ["causal-inference", "uplift-modeling", "agent-based-model", "subsidy-optimization", "behavioral-economics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=2.0",
+    "openpyxl>=3.1",
+    "scipy>=1.14",
+    "scikit-learn>=1.5",
+    "xgboost>=3.0",
+    "lightgbm>=4.6",
+    "causalml>=0.16",
+    "dowhy>=0.14",
+    "mesa>=3.5",
+    "networkx>=3.0",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+]
+
+[project.optional-dependencies]
+llm = ["openai>=1.0", "anthropic>=0.20"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "jupyter>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

@@ -18,8 +18,6 @@
 
 from __future__ import annotations
 
-import copy
-import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -36,8 +34,6 @@ from src.simulation.cognitive_agent_theory import (
     update_reference_point,
     check_account_transition,
     MentalAccountType,
-    DEFAULT_ETA_DICT,
-    DEFAULT_DESENS_RATES,
 )
 
 

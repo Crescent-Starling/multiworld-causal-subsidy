@@ -55,7 +55,9 @@ For reproducibility, we also provide **synthetically generated data** (see `data
 
 ```
 src/
-├── modeling/           # Causal inference models
+├── features/          # Data generation & feature engineering
+│   └── data_generator.py
+├── modeling/          # Causal inference models
 │   ├── causalml_wrapper.py
 │   ├── dowhy_causal_graph.py
 │   └── psm_matcher.py
@@ -66,11 +68,11 @@ src/
 │   └── llm_agent.py
 ├── evaluation/        # Evaluation metrics
 │   └── metrics.py
-└── features/          # Feature engineering
 
 scripts/               # Run scripts
 docs/                  # Documentation
 data/                  # Data (Meituan anonymized + synthetic)
+tests/                 # Unit tests
 ```
 
 ## Quick Start

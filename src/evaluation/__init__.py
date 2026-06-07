@@ -1,5 +1,5 @@
 """评估模块"""
-from src.evaluation.metrics import (
+from .metrics import (
     bootstrap_ci,
     compute_roi,
     compute_delta_gtv,
