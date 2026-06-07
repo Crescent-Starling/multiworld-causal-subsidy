@@ -32,6 +32,7 @@ from src.simulation import (
     bounded_rationality_discount, fatigue_update,
     check_account_transition, TheoreticalCognitiveAgent,
     SubsidyAgent, SubsidyModel, MultiWorldModel, StrategyType, SimulationResult,
+    SocialNetwork, SocialContagion, NetworkContagionAgent,
     PromptTemplate, LLMClient, LLMSubsidyAgent, LLMAgentSociety,
 )
 
@@ -58,6 +59,8 @@ __all__ = [
     "check_account_transition", "TheoreticalCognitiveAgent",
     # simulation - mesa
     "SubsidyAgent", "SubsidyModel", "MultiWorldModel", "StrategyType", "SimulationResult",
+    # simulation - social network
+    "SocialNetwork", "SocialContagion", "NetworkContagionAgent",
     # simulation - llm
     "PromptTemplate", "LLMClient", "LLMSubsidyAgent", "LLMAgentSociety",
     # evaluation
