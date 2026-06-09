@@ -125,13 +125,27 @@ class LLMClient:
 
     支持后端：
     - "openai": OpenAI API (gpt-4o 等), 需 API Key
-    - "anthropic": Anthropic API (Claude 等), 需 API Key
+    - "anthropic": 路由到 DeepSeek API (OpenAI 兼容格式), 需 DEEPSEEK_API_KEY
     - "deepseek": DeepSeek API (OpenAI 兼容格式), 需 DEEPSEEK_API_KEY
     - "mock": 规则回退模式，无需任何 Key
+
+    注意：
+    "anthropic" 后端已统一使用 DeepSeek API（OpenAI 兼容格式），
+    不再依赖 anthropic SDK。指定 backend="anthropic" 时，模型名支持
+    Claude 格式（如 "claude-3-5-sonnet-20241022"），会自动映射到
+    DeepSeek 对应模型；若不指定模型则使用 deepseek-v4-flash。
     """
 
     # DeepSeek OpenAI 兼容端点的默认 base_url
     DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+    # anthropic 模型名 → DeepSeek 模型名映射（近似能力对齐）
+    _ANTHROPIC_MODEL_MAP = {
+        "claude-3-haiku-20240307": "deepseek-v4-flash",
+        "claude-3-sonnet-20240229": "deepseek-v4-flash",
+        "claude-3-5-sonnet-20241022": "deepseek-v4-pro",
+        "claude-3-opus-20240229": "deepseek-v4-pro",
+    }
 
     def __init__(
         self,
@@ -143,9 +157,9 @@ class LLMClient:
         """
         Args:
             backend: "openai" | "anthropic" | "deepseek" | "mock"
-            api_key: API 密钥（OpenAI / Anthropic / DeepSeek 对应 Key）
+            api_key: API 密钥（OpenAI / DeepSeek 对应 Key）
             base_url: 自定义 API 端点的 base URL（覆盖默认值）
-            model: 默认模型名称（供 _call_openai / _call_deepseek 使用）
+            model: 默认模型名称
         """
         self.backend = backend
         self.api_key = api_key
@@ -153,44 +167,54 @@ class LLMClient:
         self.model = model
         self.client = None
 
-        if backend == "openai" and api_key:
+        # 自动从环境变量读取 API Key（若未显式传入）
+        if self.api_key is None:
+            import os
+            if backend == "openai":
+                self.api_key = os.getenv("OPENAI_API_KEY")
+            elif backend in ("deepseek", "anthropic"):
+                self.api_key = os.getenv("DEEPSEEK_API_KEY")
+
+        # api_key 为空时直接回退 mock，避免 backend 名与实际行为不一致
+        if not self.api_key:
+            self.backend = "mock"
+            return
+
+        if backend == "openai":
             try:
                 from openai import OpenAI
-                self.client = OpenAI(api_key=api_key, base_url=base_url)
+                self.client = OpenAI(api_key=self.api_key, base_url=base_url)
             except ImportError:
                 print("Warning: openai package not installed, falling back to mock")
                 self.backend = "mock"
 
-        elif backend == "deepseek" and api_key:
+        elif backend in ("deepseek", "anthropic"):
             try:
                 from openai import OpenAI
-                # DeepSeek 使用 OpenAI 兼容格式
-                # 支持的模型：deepseek-v4-pro / deepseek-v4-flash / deepseek-chat / deepseek-reasoner
+                # anthropic 后端统一走 DeepSeek OpenAI 兼容端点
                 effective_base_url = base_url or self.DEEPSEEK_BASE_URL
-                self.client = OpenAI(api_key=api_key, base_url=effective_base_url)
+                self.client = OpenAI(api_key=self.api_key, base_url=effective_base_url)
                 # 设置默认模型（如未显式指定）
                 if not self.model or self.model == "gpt-4o-mini":
                     self.model = "deepseek-v4-flash"
+                # anthropic 模型名自动映射到 DeepSeek 模型
+                elif backend == "anthropic" and self.model in self._ANTHROPIC_MODEL_MAP:
+                    mapped = self._ANTHROPIC_MODEL_MAP[self.model]
+                    print(f"  [Anthropic→DeepSeek] {self.model} → {mapped}")
+                    self.model = mapped
             except ImportError:
                 print("Warning: openai package not installed, falling back to mock")
                 self.backend = "mock"
 
-        elif backend == "anthropic" and api_key:
-            try:
-                from anthropic import Anthropic
-                self.client = Anthropic(api_key=api_key)
-            except ImportError:
-                print("Warning: anthropic package not installed, falling back to mock")
-                self.backend = "mock"
+        # mock 模式：不初始化 client，call() 会路由到 _call_mock
 
     def call(self, system_prompt: str, user_prompt: str) -> str:
         """调用LLM"""
-        if self.backend == "openai" and self.client:
+        if self.backend == "openai":
             return self._call_openai(system_prompt, user_prompt)
-        elif self.backend == "deepseek" and self.client:
+        elif self.backend in ("deepseek", "anthropic") and self.client:
+            # anthropic 后端已统一走 DeepSeek OpenAI 兼容端点
             return self._call_deepseek(system_prompt, user_prompt)
-        elif self.backend == "anthropic" and self.client:
-            return self._call_anthropic(system_prompt, user_prompt)
         else:
             return self._call_mock(system_prompt, user_prompt)
 
@@ -211,16 +235,6 @@ class LLMClient:
         """调用 DeepSeek API (OpenAI 兼容格式)"""
         return self._call_openai(system_prompt, user_prompt)
 
-    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> str:
-        """调用Anthropic API"""
-        response = self.client.messages.create(
-            model="claude-3-haiku-20240307",
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-            temperature=0.7,
-            max_tokens=500,
-        )
-        return response.content[0].text
 
     def _call_mock(self, system_prompt: str, user_prompt: str) -> str:
         """
@@ -473,12 +487,28 @@ class LLMAgentSociety:
         self.results.append(round_result)
         return round_result
 
-    def run_simulation(self, n_rounds: int = 8) -> List[Dict[str, Any]]:
-        """执行多轮仿真"""
+    def run_simulation(
+        self,
+        n_rounds: int = 8,
+        subsidy_start: float = 10.0,
+        subsidy_step: float = 2.0,
+        threshold_start: float = 30.0,
+        threshold_step: float = 5.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        执行多轮仿真
+
+        参数:
+            n_rounds: 轮数
+            subsidy_start: 初始补贴金额
+            subsidy_step: 每轮补贴增量
+            threshold_start: 初始使用门槛
+            threshold_step: 每轮门槛增量
+        """
         # 每轮递增补贴门槛（模拟策略调整）
         for r in range(n_rounds):
-            subsidy = 10.0 + r * 2.0  # 逐轮增加补贴
-            threshold = 30.0 + r * 5.0  # 逐轮增加门槛
+            subsidy = subsidy_start + r * subsidy_step
+            threshold = threshold_start + r * threshold_step
             result = self.run_round(subsidy, threshold)
 
             mode = "MOCK" if self.use_mock else "LLM"

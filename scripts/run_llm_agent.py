@@ -2,19 +2,21 @@
 LLM Agent 补贴仿真运行脚本
 
 使用 LLMSubsidyAgent / LLMAgentSociety 进行仿真。
-- 如果环境变量设置了 OPENAI_API_KEY 或 ANTHROPIC_API_KEY，可接入真实 LLM
+- 如果环境变量设置了 OPENAI_API_KEY 或 DEEPSEEK_API_KEY，可接入真实 LLM
 - 默认回退到 Mock 模式（基于规则的决策，保留推理格式）
+- anthropic 后端已统一路由到 DeepSeek API（OpenAI 兼容格式），无需 anthropic SDK
 
 用法：
     python scripts/run_llm_agent.py
     python scripts/run_llm_agent.py --n-agents 50 --n-rounds 10
-    python scripts/run_llm_agent.py --backend openai --model gpt-4o-mini
+    python scripts/run_llm_agent.py --backend deepseek --model deepseek-v4-flash
 
 环境变量：
     OPENAI_API_KEY:    OpenAI API 密钥
     DEEPSEEK_API_KEY: DeepSeek API 密钥（OpenAI 兼容格式）
-    ANTHROPIC_API_KEY: Anthropic API 密钥
+    ANTHROPIC_API_KEY: （已废弃）原 Anthropic API 密钥，现路由到 DeepSeek API
     LLM_BACKEND:       强制指定后端 (openai / deepseek / anthropic / mock)
+                       指定 anthropic 时自动路由到 DeepSeek API
 
 参考文献：
 - Park et al. (2023): Generative Agents
@@ -64,7 +66,7 @@ def check_environment() -> str:
     env_status = {
         "OPENAI_API_KEY": "已设置" if has_openai_key else "未设置",
         "DEEPSEEK_API_KEY": "已设置" if has_deepseek_key else "未设置",
-        "ANTHROPIC_API_KEY": "已设置" if has_anthropic_key else "未设置",
+        "ANTHROPIC_API_KEY": "已设置（路由到DeepSeek）" if has_anthropic_key else "未设置（已废弃）",
         "LLM_BACKEND (env override)": backend_env if backend_env else "未设置 (自动选择)",
     }
 
@@ -78,7 +80,7 @@ def check_environment() -> str:
     elif backend_env == "deepseek" or (not backend_env and has_deepseek_key):
         mode = "DeepSeek API (真实 LLM)"
     elif backend_env == "anthropic" or (not backend_env and has_anthropic_key):
-        mode = "Anthropic API (真实 LLM)"
+        mode = "Anthropic API → DeepSeek API (路由, 真实 LLM)"
     else:
         mode = "Mock 模式 (基于规则的决策回退)"
 
@@ -268,11 +270,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend", type=str, default=None,
         choices=["openai", "deepseek", "anthropic", "mock"],
-        help="强制指定 LLM 后端 (默认: 自动选择)"
+        help="强制指定 LLM 后端 (默认: 自动选择); anthropic 会路由到 DeepSeek API"
     )
     parser.add_argument(
         "--model", type=str, default=None,
-        help="LLM 模型名称 (OpenAI: gpt-4o-mini; DeepSeek: deepseek-chat / deepseek-reasoner)"
+        help="LLM 模型名称 (DeepSeek: deepseek-v4-flash / deepseek-v4-pro / deepseek-chat; Anthropic 格式也会映射到 DeepSeek)"
     )
     parser.add_argument(
         "--base-url", type=str, default=None,
@@ -348,7 +350,7 @@ def main():
         elif os.environ.get("DEEPSEEK_API_KEY"):
             backend = "deepseek"
         elif os.environ.get("ANTHROPIC_API_KEY"):
-            backend = "anthropic"
+            backend = "anthropic"  # 会路由到 DeepSeek API
         else:
             backend = "mock"
 
@@ -362,10 +364,13 @@ def main():
     elif backend == "deepseek":
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         model = model or "deepseek-chat"
-        base_url = base_url or "https://api.deepseek.com/v1"
     elif backend == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        model = model or "claude-3-haiku-20240307"
+        # anthropic 后端统一走 DeepSeek API（OpenAI 兼容格式）
+        # 优先用 ANTHROPIC_API_KEY，其次 DEEPSEEK_API_KEY
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+        model = model or "deepseek-v4-flash"
+        base_url = base_url or "https://api.deepseek.com/v1"
+        print(f"  [Anthropic→DeepSeek] 后端 'anthropic' 已路由到 DeepSeek API")
 
     llm_client = LLMClient(
         backend=backend,

@@ -36,6 +36,17 @@ from src.simulation.cognitive_agent_theory import (
     MentalAccountType,
 )
 
+# 行为链核提取模块
+from src.simulation.behavioral_kernel import (
+    UserKernel,
+    ChainStep,
+    kernel_modulated_prob,
+    ContextConfig,
+    ContextualKernel,
+    contextual_kernel_modulated_prob,
+    optimal_dosage,
+)
+
 
 # ===========================================================================
 # 枚举与数据类
@@ -43,11 +54,12 @@ from src.simulation.cognitive_agent_theory import (
 
 class StrategyType(str, Enum):
     """补贴策略类型"""
-    RANDOM = "random"         # 随机策略：随机分配（基线）
-    STATIC = "static"         # 静态策略：基于价格敏感度排序分配固定金额
-    DYNAMIC = "dynamic"       # 动态策略：基于用户画像+疲劳度动态调整金额
-    COGNITIVE = "cognitive"    # 认知策略：基于前景理论+心理账户+有限理性
-    CATE_DRIVEN = "cate_driven"  # CATE驱动策略：基于因果推断uplift评分
+    RANDOM = "random"           # 随机策略：随机分配（基线）
+    STATIC = "static"           # 静态策略：基于价格敏感度排序分配固定金额
+    DYNAMIC = "dynamic"         # 动态策略：基于用户画像+疲劳度动态调整金额
+    COGNITIVE = "cognitive"     # 认知策略：基于前景理论+心理账户+有限理性
+    CATE_DRIVEN = "cate_driven" # CATE驱动策略：基于因果推断uplift评分（单结果）
+    CATE_CHAIN = "cate_chain"   # 行为链CATE策略：加权多步骤CATE评分（多结果）
 
 
 @dataclass
@@ -61,6 +73,11 @@ class AgentConfig:
     alpha: float = 0.88       # 前景理论曲率
     lambda_: float = 2.25     # 损失厌恶系数
     decision_threshold: float = 0.3
+    # 行为链配置
+    behavior_chain_enabled: bool = False
+    category_preference: Optional[np.ndarray] = None  # 品类偏好向量 (5,)
+    # 行为链核参数（新增：替代硬编码 base_chain_rates）
+    user_kernel: Optional[UserKernel] = None  # 个体级参数化"核"
 
 
 @dataclass
@@ -69,6 +86,7 @@ class SimulationResult:
     strategy: StrategyType
     round_metrics: list[dict] = field(default_factory=list)
     final_metrics: dict = field(default_factory=dict)
+    behavior_chain_metrics: dict = field(default_factory=dict)  # 行为链各步骤指标
 
     def to_dict(self) -> dict:
         """转换为可序列化的字典"""
@@ -76,6 +94,7 @@ class SimulationResult:
             "strategy": self.strategy.value,
             "round_metrics": self.round_metrics,
             "final_metrics": self.final_metrics,
+            "behavior_chain_metrics": self.behavior_chain_metrics,
         }
 
 
@@ -126,6 +145,9 @@ class SubsidyAgent(Agent):
         lambda_: float = 2.25,
         decision_threshold: float = 0.3,
         base_gtv: Optional[float] = None,
+        behavior_chain_enabled: bool = False,
+        category_preference: Optional[np.ndarray] = None,
+        user_kernel: Optional[UserKernel] = None,
     ):
         """
         初始化Agent
@@ -141,6 +163,9 @@ class SubsidyAgent(Agent):
         - lambda_: 损失厌恶系数
         - decision_threshold: 核销决策阈值
         - base_gtv: 基础GTV（如提供则使用，否则从模型RNG生成）
+        - behavior_chain_enabled: 是否启用行为链决策
+        - category_preference: 品类偏好向量 (5,)
+        - user_kernel: 行为链核参数（替代硬编码 base_chain_rates，驱动个体级行为链决策）
         """
         super().__init__(model)
 
@@ -157,9 +182,17 @@ class SubsidyAgent(Agent):
             price_sensitivity, income_level
         )
 
+        # 行为链核参数（新增：个体级参数化"核"）
+        self.user_kernel = user_kernel
+
         # 前景理论参数（Kahneman & Tversky, 1979）
-        self.alpha = alpha       # 价值函数曲率
-        self.lambda_ = lambda_   # 损失厌恶系数
+        # 如果核参数提供了个体化值，优先使用
+        if user_kernel is not None:
+            self.alpha = user_kernel.get_gamma("alpha", alpha)
+            self.lambda_ = user_kernel.get_gamma("lambda_", lambda_)
+        else:
+            self.alpha = alpha       # 价值函数曲率
+            self.lambda_ = lambda_   # 损失厌恶系数
 
         # 决策阈值
         self.decision_threshold = decision_threshold
@@ -186,15 +219,297 @@ class SubsidyAgent(Agent):
         self._step_subsidy_amount = 0.0
         self._step_subsidized = False
 
+        # ---- 行为链扩展 ----
+        self.behavior_chain_enabled = behavior_chain_enabled
+        # 品类偏好向量（若未提供，从模型RNG生成 Dirichlet 分布）
+        if category_preference is not None:
+            self.category_preference = category_preference
+        else:
+            self.category_preference = model.rng.dirichlet(np.full(5, 0.5))
+        # 当前轮次行为链状态
+        self.funnel_state: dict = {
+            "browsed": False,
+            "clicked": False,
+            "carted":  False,
+            "paid":    False,
+            "redeemed": False,
+        }
+        # CATE 评分（行为链各步，由外部注入）
+        self.chain_cate: dict = {}  # {"clicked": float, "carted": float, ...}
+
+        # ---- 上下文支持 ----
+        # 当前决策上下文（由模型在每轮提供，如商家品类/商品价格/时段等）
+        self.current_context: Optional[ContextConfig] = None
+
     def receive_subsidy(self, amount: float) -> None:
         """接收补贴"""
         self.subsidized = True
         self.subsidy_amount = amount
         self.total_subsidy += amount
 
+    # ------------------------------------------------------------------
+    # 行为链决策（各步骤的独立概率决策）
+    # ------------------------------------------------------------------
+
+    def _step_prob(self, base_rate: float, cate_val: float, extra_boost: float = 0.0) -> float:
+        """
+        将基础转换率 + CATE 效应转化为决策概率（logistic 形式）
+
+        文献：Li & Kannan (2016) 多触点归因模型
+        """
+        logit_base = np.log(max(base_rate, 1e-6) / max(1 - base_rate, 1e-6))
+        # CATE 效应：补贴时叠加异质性效应
+        cate_boost = cate_val * self.price_sensitivity * (self.subsidy_amount / 10.0)
+        # 心理账户额外增益
+        logit = logit_base + cate_boost + extra_boost
+        # 有限理性折扣（Simon, 1955）
+        br = bounded_rationality_discount(self.cognitive_load)
+        # 疲劳折扣
+        fatigue_d = np.exp(-0.2 * self.fatigue)
+        # 随机噪声
+        noise = self.model.rng.normal(0, 0.05)
+        prob = 1.0 / (1.0 + np.exp(-(logit * br * fatigue_d + noise)))
+        return float(np.clip(prob, 0.01, 0.99))
+
+    def decide_chain(self) -> dict:
+        """
+        行为链序贯决策（漏斗模型）
+
+        决策顺序（漏斗约束：前步为 False 时后步自动跳过）：
+          browsed → clicked → carted → paid → redeemed
+
+        各步决策受以下因素调制：
+          - 前景理论价值（补贴的主观感知）
+          - 有限理性折扣（认知负荷）
+          - 心理账户类型
+          - 疲劳脱敏
+          - 品类偏好匹配度
+          - **行为链核参数（个体级基础率+补贴敏感度）**
+          - **上下文调制（商家/商品/时间/意图）**——概率是上下文变量的函数
+
+        当 self.user_kernel 存在时：
+          - 如果 current_context 存在且核为 ContextualKernel，使用 contextual_kernel_modulated_prob()
+          - 否则退化为 kernel_modulated_prob()
+        _step_prob() 计算各步决策概率，实现真正的个体级异质性。
+
+        返回 dict {"browsed": bool, "clicked": bool, ..., "redeemed": bool}
+        """
+        rates = getattr(self.model, "base_chain_rates", {
+            "clicked": 0.55, "carted": 0.33, "paid": 0.42, "redeemed": 0.64
+        })
+
+        # 如果核参数存在，用核中的个体化基础率替代全局率
+        if self.user_kernel is not None:
+            rates = {}
+            for step in ChainStep.funnel_steps():
+                rates[step.value] = self.user_kernel.get_theta(step.value, 0.5)
+
+        # 前景理论价值（影响点击与核销决策最强）
+        pv = prospect_discount(
+            subsidy=self.subsidy_amount,
+            reference=self.reference_point,
+            alpha=self.alpha,
+            lambda_=self.lambda_,
+        )
+
+        # 心理账户对各步的差异化增益
+        account_gains = {
+            MentalAccountType.WINDFALL_SPENDER: {"clicked": 0.20, "carted": 0.10, "paid": 0.05, "redeemed": 0.20},
+            MentalAccountType.PRICE_SENSITIVE:  {"clicked": 0.15, "carted": 0.08, "paid": 0.05, "redeemed": 0.10},
+            MentalAccountType.ROUTINE_INCOME:   {"clicked":-0.05, "carted":-0.02, "paid": 0.00, "redeemed":-0.05},
+            MentalAccountType.DEAL_SEEKER:      {"clicked": 0.12, "carted": 0.06, "paid": 0.04, "redeemed": 0.12},
+        }
+        gain = account_gains.get(self.mental_account, {})
+
+        # 品类偏好权重（若模型提供商品品类，则用品类匹配度调整概率）
+        category_match = float(np.mean(self.category_preference))  # 简化：用偏好均值
+
+        # CATE 各步评分（由外部注入，若无则用 0）
+        c = self.chain_cate
+
+        funnel = {"browsed": True}  # 发券即浏览
+
+        # ===== 核驱动决策 vs 传统决策 =====
+        use_kernel = self.user_kernel is not None
+
+        # clicked
+        if use_kernel:
+            # 核驱动：基础率来自核，叠加心理账户增益（保留理论贡献）
+            account_gain_click = gain.get("clicked", 0.0) if self.subsidized else 0.0
+            p_click = contextual_kernel_modulated_prob(
+                base_rate=rates["clicked"],
+                kernel=self.user_kernel,
+                step="clicked",
+                subsidy_amount=self.subsidy_amount if self.subsidized else 0.0,
+                price_sensitivity=self.price_sensitivity,
+                fatigue=self.fatigue,
+                cognitive_load=self.cognitive_load,
+                context=self.current_context,
+            )
+            # 补贴时叠加心理账户增益
+            if self.subsidized and account_gain_click > 0:
+                p_click = float(np.clip(p_click + account_gain_click, 0.01, 0.99))
+        else:
+            extra_click = gain.get("clicked", 0.0) + 0.1 * pv + 0.1 * category_match
+            base_click = rates["clicked"]
+            if self.subsidized:
+                p_click = self._step_prob(base_click, c.get("clicked", 0.0), extra_click)
+            else:
+                p_click = self._step_prob(base_click * 0.6, 0.0)
+        funnel["clicked"] = bool(self.model.rng.random() < p_click)
+
+        # carted（仅 clicked=True 时）
+        if funnel["clicked"]:
+            if use_kernel:
+                account_gain_cart = gain.get("carted", 0.0) if self.subsidized else 0.0
+                p_cart = contextual_kernel_modulated_prob(
+                    base_rate=rates["carted"],
+                    kernel=self.user_kernel,
+                    step="carted",
+                    subsidy_amount=self.subsidy_amount if self.subsidized else 0.0,
+                    price_sensitivity=self.price_sensitivity,
+                    fatigue=self.fatigue,
+                    cognitive_load=self.cognitive_load,
+                    context=self.current_context,
+                )
+                if self.subsidized and account_gain_cart > 0:
+                    p_cart = float(np.clip(p_cart + account_gain_cart, 0.01, 0.99))
+            else:
+                extra_cart = gain.get("carted", 0.0) + 0.05 * pv
+                base_cart = rates["carted"]
+                if self.subsidized:
+                    p_cart = self._step_prob(base_cart, c.get("carted", 0.0), extra_cart)
+                else:
+                    p_cart = self._step_prob(base_cart * 0.7, 0.0)
+            funnel["carted"] = bool(self.model.rng.random() < p_cart)
+        else:
+            funnel["carted"] = False
+
+        # paid（仅 carted=True 时）
+        if funnel["carted"]:
+            if use_kernel:
+                account_gain_pay = gain.get("paid", 0.0) if self.subsidized else 0.0
+                p_pay = contextual_kernel_modulated_prob(
+                    base_rate=rates["paid"],
+                    kernel=self.user_kernel,
+                    step="paid",
+                    subsidy_amount=self.subsidy_amount if self.subsidized else 0.0,
+                    price_sensitivity=self.price_sensitivity,
+                    fatigue=self.fatigue,
+                    cognitive_load=self.cognitive_load,
+                    context=self.current_context,
+                )
+                if self.subsidized and account_gain_pay > 0:
+                    p_pay = float(np.clip(p_pay + account_gain_pay, 0.01, 0.99))
+            else:
+                extra_pay = gain.get("paid", 0.0)
+                base_pay = rates["paid"]
+                if self.subsidized:
+                    p_pay = self._step_prob(base_pay, c.get("paid", 0.0), extra_pay)
+                else:
+                    p_pay = self._step_prob(base_pay * 0.75, 0.0)
+            funnel["paid"] = bool(self.model.rng.random() < p_pay)
+        else:
+            funnel["paid"] = False
+
+        # redeemed（仅 paid=True 时）
+        if funnel["paid"]:
+            if use_kernel:
+                account_gain_redeem = gain.get("redeemed", 0.0) if self.subsidized else 0.0
+                p_redeem = contextual_kernel_modulated_prob(
+                    base_rate=rates["redeemed"],
+                    kernel=self.user_kernel,
+                    step="redeemed",
+                    subsidy_amount=self.subsidy_amount if self.subsidized else 0.0,
+                    price_sensitivity=self.price_sensitivity,
+                    fatigue=self.fatigue,
+                    cognitive_load=self.cognitive_load,
+                    context=self.current_context,
+                )
+                if self.subsidized and account_gain_redeem > 0:
+                    p_redeem = float(np.clip(p_redeem + account_gain_redeem, 0.01, 0.99))
+            else:
+                extra_redeem = gain.get("redeemed", 0.0) + 0.15 * pv
+                base_redeem = rates["redeemed"]
+                if self.subsidized:
+                    p_redeem = self._step_prob(base_redeem, c.get("redeemed", 0.0), extra_redeem)
+                else:
+                    p_redeem = self._step_prob(base_redeem * 0.5, 0.0)
+            funnel["redeemed"] = bool(self.model.rng.random() < p_redeem)
+        else:
+            funnel["redeemed"] = False
+
+        return funnel
+
     def step(self) -> None:
         """
         Agent每步决策逻辑
+
+        决策流程（兼容两种模式）：
+        1. 行为链模式（behavior_chain_enabled=True）：
+           漏斗决策 browsed→clicked→carted→paid→redeemed
+        2. 单步模式（默认）：
+           前景理论价值 → 有限理性 → 疲劳折扣 → 阈值决策
+        """
+        # 重置本轮增量记账
+        self._step_gtv = 0.0
+        # 保存本轮快照
+        self._step_subsidized = self.subsidized
+        self._step_subsidy_amount = self.subsidy_amount
+
+        if self.behavior_chain_enabled:
+            self._step_chain()
+        else:
+            self._step_single()
+
+    def _step_chain(self) -> None:
+        """
+        行为链模式：漏斗决策 + GTV 计算
+
+        GTV 计算逻辑（v3，核驱动兼容）：
+        - 对照组和处理组都走漏斗决策（核驱动时概率不同）
+        - 处理组已付款：GTV = base_gtv + subsidy * 0.5 * int(redeemed)
+        - 处理组未付款：按漏斗进度给予部分 GTV
+        - 对照组：同样按漏斗进度给予部分 GTV（比硬编码 0.3 更合理）
+        """
+        # 行为链决策（所有 Agent 都走漏斗，包括对照组）
+        self.funnel_state = self.decide_chain()
+        self.redeemed = self.funnel_state["redeemed"]
+
+        # ---- GTV 计算 ----
+        if self.subsidized:
+            # 处理组
+            if self.funnel_state["paid"]:
+                self._step_gtv = self.base_gtv + self.subsidy_amount * 0.5 * int(self.redeemed)
+            else:
+                # 未付款：按漏斗进度给予部分 GTV
+                if self.funnel_state["clicked"]:
+                    if self.funnel_state["carted"]:
+                        self._step_gtv = self.base_gtv * 0.6
+                    else:
+                        self._step_gtv = self.base_gtv * 0.45
+                else:
+                    self._step_gtv = self.base_gtv * 0.35
+        else:
+            # 对照组：按漏斗进度给予部分 GTV（比硬编码 0.3 更合理）
+            if self.funnel_state["paid"]:
+                self._step_gtv = self.base_gtv * 0.8  # 对照组已付款：大部分 GTV
+            elif self.funnel_state["carted"]:
+                self._step_gtv = self.base_gtv * 0.5
+            elif self.funnel_state["clicked"]:
+                self._step_gtv = self.base_gtv * 0.3
+            else:
+                self._step_gtv = self.base_gtv * 0.15  # 仅浏览
+
+        self.total_gtv += self._step_gtv
+        if self.redeemed:
+            self.total_redemptions += 1
+
+        self._update_state()
+
+    def _step_single(self) -> None:
+        """
+        单步模式（原有逻辑，保持向后兼容）
 
         决策流程：
         1. 前景理论价值评估
@@ -203,12 +518,6 @@ class SubsidyAgent(Agent):
         4. 心理账户影响
         5. 综合决策（与阈值+噪声比较）
         """
-        # 重置本轮增量记账
-        self._step_gtv = 0.0
-        # 保存本轮快照
-        self._step_subsidized = self.subsidized
-        self._step_subsidy_amount = self.subsidy_amount
-
         if not self.subsidized:
             self.redeemed = False
             # 无补贴时仍产生基础消费（对照组GTV）
@@ -322,19 +631,26 @@ class SubsidyModel(Model):
         user_profiles: Optional[pd.DataFrame] = None,
         agent_configs: Optional[list[AgentConfig]] = None,
         cate_scores: Optional[dict[int, float]] = None,
+        # 行为链扩展参数
+        behavior_chain_enabled: bool = False,
+        chain_cate_scores: Optional[dict[int, dict]] = None,  # {agent_id: {step: cate}}
+        base_chain_rates: Optional[dict] = None,
     ):
         """
         初始化仿真模型
 
         参数：
         - n_agents: Agent数量
-        - strategy: 补贴策略类型（random/static/dynamic/cognitive/cate_driven）
+        - strategy: 补贴策略类型（random/static/dynamic/cognitive/cate_driven/cate_chain）
         - budget_ratio: 预算覆盖比例（受补贴用户占比）
         - subsidy_amount: 基础补贴金额（元）
         - seed: 随机种子
         - user_profiles: 可选的用户画像DataFrame
         - agent_configs: 预生成的Agent配置列表（多世界共享画像时使用）
         - cate_scores: 可选的{agent_id: CATE}映射（CATE驱动策略时使用）
+        - behavior_chain_enabled: 是否启用行为链仿真
+        - chain_cate_scores: {agent_id: {"clicked": c1, "carted": c2, ...}}（行为链CATE）
+        - base_chain_rates: 行为链各步基础转换率
         """
         super().__init__()
         self.n_agents = n_agents
@@ -344,6 +660,12 @@ class SubsidyModel(Model):
         self.seed = seed
         self.rng = np.random.RandomState(seed)
         self.cate_scores = cate_scores or {}
+        # 行为链
+        self.behavior_chain_enabled = behavior_chain_enabled
+        self.chain_cate_scores = chain_cate_scores or {}
+        self.base_chain_rates = base_chain_rates or {
+            "clicked": 0.75, "carted": 0.65, "paid": 0.82, "redeemed": 0.70
+        }
 
         self.current_round = 0
         self.round_results: list[dict] = []
@@ -376,7 +698,13 @@ class SubsidyModel(Model):
                     lambda_=cfg.lambda_,
                     decision_threshold=cfg.decision_threshold,
                     base_gtv=cfg.base_gtv,  # 共享base_gtv，确保各世界Agent起点一致
+                    behavior_chain_enabled=getattr(cfg, "behavior_chain_enabled", self.behavior_chain_enabled),
+                    category_preference=getattr(cfg, "category_preference", None),
+                    user_kernel=getattr(cfg, "user_kernel", None),
                 )
+                # 注入行为链 CATE 评分
+                if self.chain_cate_scores and cfg.agent_id in self.chain_cate_scores:
+                    agent.chain_cate = self.chain_cate_scores[cfg.agent_id]
         elif user_profiles is not None:
             n = min(self.n_agents, len(user_profiles))
             for i in range(n):
@@ -387,7 +715,10 @@ class SubsidyModel(Model):
                     price_sensitivity=row.get("price_sensitivity", 0.5),
                     income_level=int(row.get("income_level", 3)),
                     city_tier=int(row.get("city_tier", 3)),
+                    behavior_chain_enabled=self.behavior_chain_enabled,
                 )
+                if self.chain_cate_scores and i in self.chain_cate_scores:
+                    agent.chain_cate = self.chain_cate_scores[i]
         else:
             for i in range(self.n_agents):
                 ps = self.rng.beta(2, 5)
@@ -399,7 +730,10 @@ class SubsidyModel(Model):
                     price_sensitivity=ps,
                     income_level=income,
                     city_tier=city,
+                    behavior_chain_enabled=self.behavior_chain_enabled,
                 )
+                if self.chain_cate_scores and i in self.chain_cate_scores:
+                    agent.chain_cate = self.chain_cate_scores[i]
 
     def _allocate_subsidy(self) -> None:
         """
@@ -496,25 +830,92 @@ class SubsidyModel(Model):
                 amount = self.subsidy_amount * (1.1 - 0.3 * cate_norm)
                 agent.receive_subsidy(max(amount, 5.0))
 
+        elif self.strategy == StrategyType.CATE_CHAIN:
+            # 行为链CATE策略：加权多步骤CATE评分
+            # 默认权重：click=0.35, cart=0.15, pay=0.15, redeem=0.35
+            chain_weights = {"clicked": 0.35, "carted": 0.15, "paid": 0.15, "redeemed": 0.35}
+
+            def chain_score(a):
+                """行为链综合CATE评分：加权求和各步骤CATE"""
+                cates = self.chain_cate_scores.get(a.agent_id, {})
+                if not cates:
+                    return 0.0
+                total = sum(chain_weights.get(step, 0.0) * cates.get(step, 0.0)
+                            for step in chain_weights)
+                return total
+
+            # 仅对正综合 CATE 用户补贴
+            positive_chain_agents = [
+                a for a in agents_list if chain_score(a) > 0
+            ]
+            positive_chain_agents.sort(key=chain_score, reverse=True)
+            n_subsidize = min(n_to_subsidize, len(positive_chain_agents))
+
+            for agent in positive_chain_agents[:n_subsidize]:
+                agent.receive_subsidy(self.subsidy_amount)
+
     def step(self) -> None:
         """
         模型每步执行
 
         流程：
-        1. 策略分配 → 为Agent分配补贴
-        2. Agent决策 → 执行所有Agent的step()
-        3. 收集结果 → 汇总指标
+        1. 上下文分配 → 为Agent分配本轮决策上下文
+        2. 策略分配 → 为Agent分配补贴
+        3. Agent决策 → 执行所有Agent的step()
+        4. 收集结果 → 汇总指标
         """
         self.current_round += 1
 
-        # 1. 分配补贴
+        # 1. 上下文分配（每轮为每个Agent随机分配一个决策场景）
+        self._assign_contexts()
+
+        # 2. 分配补贴
         self._allocate_subsidy()
 
-        # 2. Agent决策（Mesa 3.x: 使用 agents.do() 替代 schedule.step()）
+        # 3. Agent决策（Mesa 3.x: 使用 agents.do() 替代 schedule.step()）
         self.agents.do("step")
 
-        # 3. 收集指标
+        # 4. 收集指标
         self.collect_results()
+
+    def _assign_contexts(self) -> None:
+        """
+        为每个Agent分配本轮决策上下文
+
+        模拟真实场景：用户每轮访问平台时，面对的商家/商品/时段不同。
+        上下文由品类偏好驱动（用户更可能访问偏好品类）+ 随机扰动。
+        """
+        for agent in self.agents:
+            # 从品类偏好中采样商家品类（偏好高的品类访问概率更大）
+            cat_probs = agent.category_preference
+            merchant_cat = int(self.rng.choice(5, p=cat_probs))
+
+            # 价格水平（与收入等级相关 + 随机）
+            price_level = int(np.clip(
+                agent.income_level + self.rng.randint(-1, 2), 0, 2
+            ))
+
+            # 时段（均匀分布）
+            time_of_day = int(self.rng.randint(0, 4))
+
+            # 会话意图（与品类相关：到餐→搜索/复购，闪购→闲逛/比价）
+            if merchant_cat == 0:  # 到餐
+                session_intent = int(self.rng.choice([1, 2], p=[0.5, 0.5]))
+            elif merchant_cat == 1:  # 闪购
+                session_intent = int(self.rng.choice([0, 3], p=[0.5, 0.5]))
+            else:
+                session_intent = int(self.rng.randint(0, 4))
+
+            # 竞争激烈度
+            competition = float(self.rng.uniform(0.1, 0.7))
+
+            agent.current_context = ContextConfig(
+                merchant_category=merchant_cat,
+                price_level=price_level,
+                time_of_day=time_of_day,
+                session_intent=session_intent,
+                competition_intensity=competition,
+            )
 
     def collect_results(self) -> dict:
         """
@@ -565,6 +966,16 @@ class SubsidyModel(Model):
             "avg_reference_point": np.mean([a.reference_point for a in agents_list]),
         }
 
+        # 行为链指标（仅当 behavior_chain_enabled=True 时收集）
+        if self.behavior_chain_enabled:
+            chain_steps = ["browsed", "clicked", "carted", "paid", "redeemed"]
+            for step in chain_steps:
+                step_cnt = sum(
+                    1 for a in treated
+                    if getattr(a, "funnel_state", {}).get(step, False)
+                )
+                result[f"chain_{step}_rate"] = step_cnt / max(n_treated, 1)
+
         self.round_results.append(result)
         return result
 
@@ -572,18 +983,41 @@ class SubsidyModel(Model):
         """获取所有轮次的结果汇总"""
         return pd.DataFrame(self.round_results)
 
-    def run(self, n_rounds: int = 30) -> SimulationResult:
+    def run(
+        self,
+        n_rounds: int = 30,
+        kernel_updater: Optional[Any] = None,  # KernelOnlineUpdater
+        kernel_tracker: Optional[Any] = None,  # MultiWorldKernelTracker
+        world_name: str = "",
+    ) -> "SimulationResult":
         """
         运行完整仿真
 
         参数：
         - n_rounds: 仿真轮数
+        - kernel_updater: 可选，在线核更新器（启用后每轮更新Agent核参数）
+        - kernel_tracker: 可选，核演化追踪器（记录每轮核参数快照）
+        - world_name: 世界名称（用于追踪器记录）
 
         返回：
         - SimulationResult
         """
-        for _ in range(n_rounds):
+        for r in range(n_rounds):
             self.step()
+
+            # 在线核更新：每轮结束后更新Agent的核参数
+            if kernel_updater is not None:
+                kernel_updater.update_all_kernels(
+                    list(self.agents), world_name=world_name, round_num=r
+                )
+
+            # 核演化追踪：记录每轮快照
+            if kernel_tracker is not None:
+                kernel_tracker.register_snapshot(
+                    world_name=world_name,
+                    round_num=r,
+                    agents=list(self.agents),
+                )
 
         # 计算最终汇总
         summary = self.get_summary()
@@ -698,6 +1132,8 @@ class MultiWorldModel:
         budget_ratio: float = 0.3,
         subsidy_amount: float = 10.0,
         cate_scores: Optional[dict[int, float]] = None,
+        kernel_updater: Optional[Any] = None,  # KernelOnlineUpdater
+        kernel_tracker: Optional[Any] = None,  # MultiWorldKernelTracker
     ) -> SimulationResult:
         """
         添加并运行一个平行世界
@@ -708,6 +1144,8 @@ class MultiWorldModel:
         - budget_ratio: 预算覆盖比例
         - subsidy_amount: 基础补贴金额
         - cate_scores: CATE评分（CATE驱动策略时使用）
+        - kernel_updater: 可选，在线核更新器
+        - kernel_tracker: 可选，核演化追踪器
 
         返回：
         - SimulationResult
@@ -721,7 +1159,12 @@ class MultiWorldModel:
             agent_configs=self._agent_configs,  # 共享Agent配置
             cate_scores=cate_scores,
         )
-        result = model.run(n_rounds=self.n_rounds)
+        result = model.run(
+            n_rounds=self.n_rounds,
+            kernel_updater=kernel_updater,
+            kernel_tracker=kernel_tracker,
+            world_name=world_name,
+        )
         self.world_results[world_name] = result
         return result
 

@@ -17,6 +17,10 @@ import argparse
 import numpy as np
 import pandas as pd
 
+# Load .env file (API keys) before anything else
+from dotenv import load_dotenv
+load_dotenv()
+
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -50,10 +54,39 @@ def run_causal_inference_demo(causal_data: pd.DataFrame, verbose: bool = True) -
             cate = result["cate_causalml"].values.flatten()
             true_cate = causal_data["true_cate"].values
             corr = np.corrcoef(cate, true_cate)[0, 1]
-            results["causalml"][learner_type] = {"ate_mean": float(cate.mean()), "corr": float(corr)}
+
+            # 评估 CATE 质量（AUUC / Qini）
+            eval_metrics = wrapper.evaluate_cate_quality(
+                causal_data, "treatment", "outcome", "true_cate"
+            )
+            results["causalml"][learner_type] = {
+                "ate_mean": float(cate.mean()),
+                "corr": float(corr),
+                "auuc": eval_metrics.get("auuc_score"),
+                "qini": eval_metrics.get("qini_score"),
+                "cate_mse": eval_metrics.get("cate_mse"),
+                "positive_cate_ratio": eval_metrics.get("positive_cate_ratio"),
+            }
 
             if verbose:
-                print(f"  {learner_type.upper():12s} | ATE={cate.mean():.4f} | Corr={corr:.4f}")
+                print(f"  {learner_type.upper():12s} | ATE={cate.mean():.4f} "
+                      f"| Corr={corr:.4f} | AUUC={eval_metrics.get('auuc_score', 'N/A')} "
+                      f"| Qini={eval_metrics.get('qini_score', 'N/A')}")
+
+            # 保存 Qini curve 和 Cumulative Gain curve
+            try:
+                os.makedirs("output/figures", exist_ok=True)
+                wrapper.plot_qini_curve(
+                    causal_data, "treatment", "outcome",
+                    save_path=f"output/figures/qini_curve_{learner_type}.png"
+                )
+                wrapper.plot_cumulative_gain(
+                    causal_data, "treatment", "outcome",
+                    save_path=f"output/figures/cumgain_curve_{learner_type}.png"
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  Plotting failed for {learner_type}: {e}")
     except Exception as e:
         if verbose:
             print(f"  CausalML FAILED: {e}")
@@ -361,7 +394,14 @@ def save_results(all_results: dict, output_dir: str = "output") -> None:
         causal = all_results["causal"]
         rows = []
         for method, vals in causal.get("causalml", {}).items():
-            rows.append({"method": f"CausalML_{method}", "ate_mean": vals.get("ate_mean"), "corr": vals.get("corr")})
+            rows.append({
+                "method": f"CausalML_{method}",
+                "ate_mean": vals.get("ate_mean"),
+                "corr": vals.get("corr"),
+                "auuc_score": vals.get("auuc"),
+                "qini_score": vals.get("qini"),
+                "cate_mse": vals.get("cate_mse"),
+            })
         if causal.get("dowhy"):
             rows.append({"method": "DoWhy", "ate": causal["dowhy"].get("ate")})
         if causal.get("psm"):

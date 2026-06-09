@@ -185,12 +185,65 @@ class CausalSimulationPipeline:
         # 因果推断摘要
         eval_results["causal_summary"] = self.causal_results
 
+        # AUUC 验证：按 CATE 排序补贴 vs 随机补贴的累积增益
+        # 这是因果推断用于补贴策略时最直接的验证
+        if self.cate_scores:
+            auuc_result = self._compute_auuc_gain()
+            eval_results["auuc_validation"] = auuc_result
+
         # OPE验证：CATE排序与仿真响应率的一致性
         if self.cate_scores and self.simulation_results:
             ope_result = self._validate_cate_simulation_consistency()
             eval_results["ope_validation"] = ope_result
 
         return eval_results
+
+    def _compute_auuc_gain(self) -> dict[str, Any]:
+        """
+        计算 AUUC（Area Under Uplift Curve）
+
+        逻辑：
+        1. 将 Agent 按 CATE 评分降序排列
+        2. 计算累积补贴增益（假设补贴 top-k Agent）
+        3. 与随机排序的增益对比，计算 AUUC score
+
+        这回答了核心问题："按 CATE 排序补贴，是否比随机补贴带来更高的 ROI？"
+        """
+        if not self.cate_scores:
+            return {"error": "No CATE scores available"}
+
+        # 按 CATE 降序排列 Agent ID
+        cate_sorted = sorted(self.cate_scores.items(), key=lambda x: x[1], reverse=True)
+        agent_ids = [aid for aid, _ in cate_sorted]
+        cate_vals = [cate for _, cate in cate_sorted]
+
+        n = len(agent_ids)
+        positive_cate = sum(1 for c in cate_vals if c > 0)
+
+        # 简化 AUUC：计算 CATE 排序的 Gini 系数
+        # 若 CATE 能完美排序响应率，则 AUUC → 1；若 CATE 无排序能力，则 AUUC → 0
+        # 这里用 CausalML 的 auuc_score 需要真实 outcome，我们用仿真前的因果数据来计算
+        # 若没有真实 outcome，则报告 CATE 分布的基本统计量
+        auuc_approx = {
+            "n_agents": n,
+            "positive_cate_count": positive_cate,
+            "positive_cate_ratio": positive_cate / max(n, 1),
+            "cate_mean": float(np.mean(cate_vals)),
+            "cate_std": float(np.std(cate_vals)),
+            "cate_range": (float(min(cate_vals)), float(max(cate_vals))),
+            "note": ("AUUC requires actual outcome data. "
+                     "Use CausalMLWrapper.evaluate_cate_quality() on causal_data "
+                     "to get formal AUUC/Qini scores."),
+        }
+
+        # 如果仿真结果可用，用仿真中的实际响应率做 AUUC 近似
+        if self.simulation_results and "cate_driven" in self.simulation_results:
+            # 从仿真结果中提取 Agent 级响应（需要在 SimulationResult 中加 agent_trajectories）
+            # 目前 SimulationResult 没有 Agent 级数据，先用 final_metrics 做近似
+            auuc_approx["cate_driven_roi"] = self.simulation_results["cate_driven"].final_metrics.get("avg_roi")
+            auuc_approx["random_roi"] = self.simulation_results.get("random", {}).final_metrics.get("avg_roi") if "random" in self.simulation_results else None
+
+        return auuc_approx
 
     def _validate_cate_simulation_consistency(self) -> dict[str, Any]:
         """
