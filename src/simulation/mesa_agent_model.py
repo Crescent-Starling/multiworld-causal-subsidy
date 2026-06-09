@@ -241,6 +241,10 @@ class SubsidyAgent(Agent):
         # 当前决策上下文（由模型在每轮提供，如商家品类/商品价格/时段等）
         self.current_context: Optional[ContextConfig] = None
 
+        # ---- 商家原型支持（v2 情境化场景） ----
+        # 当前轮次分配到的商家原型（由模型的 _assign_contexts() 或 _assign_merchant_contexts() 设置）
+        self.current_merchant = None  # type: Optional[MerchantPrototype]
+
     def receive_subsidy(self, amount: float) -> None:
         """接收补贴"""
         self.subsidized = True
@@ -635,6 +639,8 @@ class SubsidyModel(Model):
         behavior_chain_enabled: bool = False,
         chain_cate_scores: Optional[dict[int, dict]] = None,  # {agent_id: {step: cate}}
         base_chain_rates: Optional[dict] = None,
+        # 商家原型支持（v2）
+        merchant_registry: Optional[Any] = None,
     ):
         """
         初始化仿真模型
@@ -651,6 +657,7 @@ class SubsidyModel(Model):
         - behavior_chain_enabled: 是否启用行为链仿真
         - chain_cate_scores: {agent_id: {"clicked": c1, "carted": c2, ...}}（行为链CATE）
         - base_chain_rates: 行为链各步基础转换率
+        - merchant_registry: MerchantRegistry实例（v2商家原型支持，为Agent分配具体场景）
         """
         super().__init__()
         self.n_agents = n_agents
@@ -666,6 +673,8 @@ class SubsidyModel(Model):
         self.base_chain_rates = base_chain_rates or {
             "clicked": 0.75, "carted": 0.65, "paid": 0.82, "redeemed": 0.70
         }
+        # 商家原型注册表（v2）
+        self.merchant_registry = merchant_registry
 
         self.current_round = 0
         self.round_results: list[dict] = []
@@ -884,38 +893,62 @@ class SubsidyModel(Model):
 
         模拟真实场景：用户每轮访问平台时，面对的商家/商品/时段不同。
         上下文由品类偏好驱动（用户更可能访问偏好品类）+ 随机扰动。
+
+        v2 升级：如果模型持有 merchant_registry，同时分配商家原型。
         """
+        # 如果有商家注册表，使用商家原型驱动上下文分配
+        has_registry = hasattr(self, 'merchant_registry') and self.merchant_registry is not None
+
         for agent in self.agents:
-            # 从品类偏好中采样商家品类（偏好高的品类访问概率更大）
-            cat_probs = agent.category_preference
-            merchant_cat = int(self.rng.choice(5, p=cat_probs))
+            if has_registry:
+                # v2: 从商家注册表采样原型，再映射到 ContextConfig
+                merchant = self.merchant_registry.sample_for_user(agent.income_level)
+                agent.current_merchant = merchant
 
-            # 价格水平（与收入等级相关 + 随机）
-            price_level = int(np.clip(
-                agent.income_level + self.rng.randint(-1, 2), 0, 2
-            ))
+                # 时段采样
+                time_of_day = int(self.rng.randint(0, 4))
 
-            # 时段（均匀分布）
-            time_of_day = int(self.rng.randint(0, 4))
+                # 会话意图
+                if merchant.category_l1 in ("美食", "餐饮", "饮品"):
+                    session_intent = int(self.rng.choice([1, 2], p=[0.5, 0.5]))
+                elif merchant.category_l1 in ("超市便利",):
+                    session_intent = int(self.rng.choice([0, 3], p=[0.5, 0.5]))
+                else:
+                    session_intent = int(self.rng.randint(0, 4))
 
-            # 会话意图（与品类相关：到餐→搜索/复购，闪购→闲逛/比价）
-            if merchant_cat == 0:  # 到餐
-                session_intent = int(self.rng.choice([1, 2], p=[0.5, 0.5]))
-            elif merchant_cat == 1:  # 闪购
-                session_intent = int(self.rng.choice([0, 3], p=[0.5, 0.5]))
+                agent.current_context = merchant.to_context_config(
+                    time_of_day=time_of_day,
+                    session_intent=session_intent,
+                    competition_intensity=float(self.rng.uniform(0.1, 0.7)),
+                )
             else:
-                session_intent = int(self.rng.randint(0, 4))
+                # v1: 原有逻辑（5维粗粒度品类偏好）
+                cat_probs = agent.category_preference
+                merchant_cat = int(self.rng.choice(5, p=cat_probs))
 
-            # 竞争激烈度
-            competition = float(self.rng.uniform(0.1, 0.7))
+                price_level = int(np.clip(
+                    agent.income_level + self.rng.randint(-1, 2), 0, 2
+                ))
 
-            agent.current_context = ContextConfig(
-                merchant_category=merchant_cat,
-                price_level=price_level,
-                time_of_day=time_of_day,
-                session_intent=session_intent,
-                competition_intensity=competition,
-            )
+                time_of_day = int(self.rng.randint(0, 4))
+
+                if merchant_cat == 0:
+                    session_intent = int(self.rng.choice([1, 2], p=[0.5, 0.5]))
+                elif merchant_cat == 1:
+                    session_intent = int(self.rng.choice([0, 3], p=[0.5, 0.5]))
+                else:
+                    session_intent = int(self.rng.randint(0, 4))
+
+                competition = float(self.rng.uniform(0.1, 0.7))
+
+                agent.current_context = ContextConfig(
+                    merchant_category=merchant_cat,
+                    price_level=price_level,
+                    time_of_day=time_of_day,
+                    session_intent=session_intent,
+                    competition_intensity=competition,
+                )
+                agent.current_merchant = None
 
     def collect_results(self) -> dict:
         """
@@ -989,6 +1022,7 @@ class SubsidyModel(Model):
         kernel_updater: Optional[Any] = None,  # KernelOnlineUpdater
         kernel_tracker: Optional[Any] = None,  # MultiWorldKernelTracker
         world_name: str = "",
+        merchant_registry: Optional[Any] = None,  # MerchantRegistry (v2)
     ) -> "SimulationResult":
         """
         运行完整仿真
@@ -998,10 +1032,15 @@ class SubsidyModel(Model):
         - kernel_updater: 可选，在线核更新器（启用后每轮更新Agent核参数）
         - kernel_tracker: 可选，核演化追踪器（记录每轮核参数快照）
         - world_name: 世界名称（用于追踪器记录）
+        - merchant_registry: 可选，商家注册表（v2 情境化场景）
 
         返回：
         - SimulationResult
         """
+        # 注入商家注册表（如未通过 __init__ 设置）
+        if merchant_registry is not None:
+            self.merchant_registry = merchant_registry
+
         for r in range(n_rounds):
             self.step()
 

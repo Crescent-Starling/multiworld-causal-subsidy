@@ -5,8 +5,14 @@ LLM Agent仿真模块
 
 支持：
 1. OpenAI API（GPT-4等）
-2. Anthropic API（Claude等）
+2. DeepSeek API（OpenAI兼容格式）
 3. Mock模式（无需API Key，使用规则回退）
+
+v2 升级（商家原型 + 情境化Prompt）：
+- 从抽象数字Prompt → 具体消费场景Prompt
+- 从硬标签角色 → 行为特质软约束
+- 从JSON输出 → 内心独白式推理 + 结构化提取
+- 支持商家原型(MerchantPrototype)注入场景描述
 
 参考文献:
 - Park, J. S., et al. (2023). Generative Agents: Interactive Simulacra
@@ -21,16 +27,94 @@ import json
 import re
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.simulation.merchant_prototype import MerchantPrototype
 
 
 # ===========================================================================
-# 心理账户类型对应的提示词模板
+# 情境化提示词模板 (v2)
 # ===========================================================================
 
 class PromptTemplate:
-    """LLM提示词模板"""
+    """
+    LLM提示词模板
 
+    v2 升级要点：
+    1. 角色从硬标签"你是XX型消费者"→行为特质描述（软约束）
+    2. 场景从抽象数字→具体消费情境（商家原型注入）
+    3. 输出从JSON→内心独白式推理+结构化决策
+    """
+
+    # ------------------------------------------------------------------
+    # 角色行为特质描述（软约束，替代硬标签）
+    # ------------------------------------------------------------------
+    PERSONA_TRAITS = {
+        "windfall_spender": (
+            "你月收入中等，不太记账。碰到优惠总觉得是'意外之财'，"
+            "花起来没什么心理负担。平时消费不太做计划，"
+            "看到划算的就多看两眼，也不太在意门槛高低。"
+            "你偶尔会冲动消费，但也不会买完全不需要的东西。"
+        ),
+        "price_sensitive": (
+            "你习惯记账，买东西前会算一下单位价格。"
+            "对折扣力度很敏感，会对比不同方案再决定。"
+            "门槛太高会直接放弃——你觉得凑单是被商家牵着走。"
+            "但对真正划算的优惠你会果断出手。"
+        ),
+        "routine_income": (
+            "你把补贴当成收入的一部分，而非'意外之财'。"
+            "消费前会想'我原本就打算买这个吗'，"
+            "不会为了用券而买不需要的东西。"
+            "你消费习惯比较稳定，不太受情绪驱动。"
+        ),
+        "deal_seeker": (
+            "你享受寻找优惠的过程，薅到羊毛会有成就感。"
+            "会关注不同平台的优惠信息，看到好价会分享给朋友。"
+            "但你也不傻——优惠力度不够你也不会凑单。"
+            "你消费频率较高，所以凑单门槛对你来说不算太高。"
+        ),
+    }
+
+    # ------------------------------------------------------------------
+    # 系统提示词（v2：内心独白式推理 + 场景化决策）
+    # ------------------------------------------------------------------
+    SYSTEM_TEMPLATE_V2 = """你是一个真实的消费者，正在面对一个消费决策。请像真实用户一样思考——不是在"分析数据"，而是在"经历一个消费时刻"。
+
+{persona_description}
+
+重要指导原则：
+1. 从你自己的角度出发，思考这个具体的消费场景——不要做抽象的"折扣率计算"
+2. 考虑你的实际需求：你现在真的想吃/买这个吗？还是纯粹因为券才考虑的？
+3. 想想替代选项：不用券你会买什么？用了券你会多花多少？
+4. 如果有具体商品信息，评估你对这些商品的真实兴趣
+5. 考虑时机：现在合适吗？还是留着以后更好？
+
+请先写出你的内心想法（像真实用户会想的那样），然后在最后一行给出你的决策。
+
+输出格式：
+[内心独白]
+你的思考过程...（像真实用户一样，可以纠结、犹豫、联想具体场景）
+
+[决策]
+核销: 是/否"""
+
+    # ------------------------------------------------------------------
+    # 用户提示词（v2：情境化场景描述）
+    # ------------------------------------------------------------------
+    USER_TEMPLATE_V2 = """{scene_description}
+
+你的情况：
+- 月消费频率：{consumption_freq}次/月
+- 过去7天是否收到过补贴：{recent_subsidy}
+- 当前疲劳程度：{fatigue_level}（{fatigue_explanation}）
+
+请做出你的决策："""
+
+    # ------------------------------------------------------------------
+    # 旧版模板（向后兼容）
+    # ------------------------------------------------------------------
     SYSTEM_BASE = """你是一位消费者行为模拟Agent。你需要根据给定的场景信息，模拟一个真实消费者面对优惠券补贴时的决策过程。
 
 请严格按照以下JSON格式输出你的决策：
@@ -58,7 +142,6 @@ class PromptTemplate:
 - 你对补贴的使用门槛不太敏感，只要有补贴就倾向于使用
 - 你的参考点较低，容易满足
 """,
-
         "price_sensitive": SYSTEM_BASE + """
 你的消费画像：
 - 你是一个"价格敏感型"消费者，对价格变化非常敏感
@@ -66,7 +149,6 @@ class PromptTemplate:
 - 你对补贴的使用门槛很敏感，门槛过高会放弃
 - 你经常搜索和比较价格信息
 """,
-
         "routine_income": SYSTEM_BASE + """
 你的消费画像：
 - 你是一个"常规收入型"消费者，将补贴视为收入的一部分
@@ -74,7 +156,6 @@ class PromptTemplate:
 - 你更关注补贴是否能带来实际价值
 - 你的消费决策较为理性，不受情绪驱动
 """,
-
         "deal_seeker": SYSTEM_BASE + """
 你的消费画像：
 - 你是一个"捡漏型"消费者，热衷于寻找优惠
@@ -96,23 +177,55 @@ class PromptTemplate:
 请做出你的决策：
 """
 
-    @classmethod
-    def get_system_prompt(cls, mental_account: str) -> str:
-        """获取系统提示词"""
-        return cls.TEMPLATES.get(mental_account, cls.TEMPLATES["routine_income"])
+    # ------------------------------------------------------------------
+    # 疲劳程度解释文本
+    # ------------------------------------------------------------------
+    FATIGUE_EXPLANATIONS = {
+        "低": "近期补贴较少，你对新的优惠还有新鲜感",
+        "中": "近期收到了一些补贴，开始觉得有点多，但还没到厌烦的程度",
+        "高": "近期补贴频繁，你已经对优惠信息产生了一定程度的疲劳，开始忽略推送",
+    }
+
+    # ------------------------------------------------------------------
+    # 类方法
+    # ------------------------------------------------------------------
 
     @classmethod
-    def get_user_prompt(cls, **kwargs) -> str:
+    def get_system_prompt(cls, mental_account: str, use_v2: bool = True) -> str:
+        """获取系统提示词"""
+        if use_v2:
+            persona = cls.PERSONA_TRAITS.get(
+                mental_account, cls.PERSONA_TRAITS["routine_income"]
+            )
+            return cls.SYSTEM_TEMPLATE_V2.format(persona_description=persona)
+        else:
+            return cls.TEMPLATES.get(
+                mental_account, cls.TEMPLATES["routine_income"]
+            )
+
+    @classmethod
+    def get_user_prompt(cls, use_v2: bool = True, **kwargs) -> str:
         """获取用户提示词"""
-        defaults = {
-            "subsidy_amount": 10,
-            "threshold": 30,
-            "consumption_freq": 5,
-            "recent_subsidy": "是",
-            "fatigue_level": "低",
-        }
-        defaults.update(kwargs)
-        return cls.USER_TEMPLATE.format(**defaults)
+        if use_v2:
+            defaults = {
+                "scene_description": "你打开美团，看到一个优惠活动。",
+                "consumption_freq": 5,
+                "recent_subsidy": "否",
+                "fatigue_level": "低",
+                "fatigue_explanation": "近期补贴较少，你对新的优惠还有新鲜感",
+            }
+            defaults.update(kwargs)
+            return cls.USER_TEMPLATE_V2.format(**defaults)
+        else:
+            defaults = {
+                "subsidy_amount": 10,
+                "threshold": 30,
+                "consumption_freq": 5,
+                "recent_subsidy": "是",
+                "fatigue_level": "低",
+            }
+            defaults.update(kwargs)
+            return cls.USER_TEMPLATE.format(**defaults)
 
 
 # ===========================================================================
@@ -295,6 +408,12 @@ class LLMSubsidyAgent:
 
     使用LLM模拟消费者面对补贴时的决策过程，
     包含完整的推理链（Chain-of-Thought）。
+
+    v2 升级：
+    - 支持商家原型(MerchantPrototype)注入情境化场景
+    - 角色从硬标签→行为特质软约束
+    - 输出从JSON→内心独白式推理
+    - 向后兼容旧版decide()接口
     """
 
     def __init__(
@@ -306,6 +425,7 @@ class LLMSubsidyAgent:
         consumption_freq: int = 5,
         llm_client: Optional[LLMClient] = None,
         model: str = "gpt-4o-mini",
+        use_v2_prompt: bool = True,
     ):
         self.agent_id = agent_id
         self.mental_account = mental_account
@@ -313,6 +433,7 @@ class LLMSubsidyAgent:
         self.income_level = income_level
         self.consumption_freq = consumption_freq
         self.llm = llm_client or LLMClient(backend="mock", model=model)
+        self.use_v2_prompt = use_v2_prompt
 
         # 内部状态
         self.fatigue = 0.0
@@ -327,6 +448,8 @@ class LLMSubsidyAgent:
         self,
         subsidy_amount: float,
         threshold: float = 30.0,
+        merchant: Optional["MerchantPrototype"] = None,
+        time_of_day: str = "午餐时段",
     ) -> Dict[str, Any]:
         """
         使用LLM决策
@@ -334,25 +457,55 @@ class LLMSubsidyAgent:
         参数:
             subsidy_amount: 补贴金额
             threshold: 使用门槛
+            merchant: 商家原型（v2，用于生成情境化场景描述）
+            time_of_day: 当前时段描述（v2）
 
         返回:
             {"redeemed": bool, "reasoning": str, "confidence": float}
         """
-        # 构建提示词
-        system_prompt = PromptTemplate.get_system_prompt(self.mental_account)
-        user_prompt = PromptTemplate.get_user_prompt(
-            subsidy_amount=int(subsidy_amount),
-            threshold=int(threshold),
-            consumption_freq=self.consumption_freq,
-            recent_subsidy="是" if self.n_subsidized > 0 else "否",
-            fatigue_level=self._fatigue_label(),
-        )
+        if self.use_v2_prompt and merchant is not None:
+            # v2: 情境化场景 Prompt
+            scene = merchant.describe_scene(
+                subsidy_amount=subsidy_amount,
+                threshold=threshold,
+                time_of_day=time_of_day,
+            )
+            system_prompt = PromptTemplate.get_system_prompt(
+                self.mental_account, use_v2=True
+            )
+            fatigue_label = self._fatigue_label()
+            user_prompt = PromptTemplate.get_user_prompt(
+                use_v2=True,
+                scene_description=scene,
+                consumption_freq=self.consumption_freq,
+                recent_subsidy="是" if self.n_subsidized > 0 else "否",
+                fatigue_level=fatigue_label,
+                fatigue_explanation=PromptTemplate.FATIGUE_EXPLANATIONS.get(
+                    fatigue_label, ""
+                ),
+            )
+        else:
+            # v1 向后兼容（无商家原型时）
+            system_prompt = PromptTemplate.get_system_prompt(
+                self.mental_account, use_v2=False
+            )
+            user_prompt = PromptTemplate.get_user_prompt(
+                use_v2=False,
+                subsidy_amount=int(subsidy_amount),
+                threshold=int(threshold),
+                consumption_freq=self.consumption_freq,
+                recent_subsidy="是" if self.n_subsidized > 0 else "否",
+                fatigue_level=self._fatigue_label(),
+            )
 
         # 调用LLM
         response_text = self.llm.call(system_prompt, user_prompt)
 
         # 解析结果
-        result = self._parse_response(response_text)
+        if self.use_v2_prompt and merchant is not None:
+            result = self._parse_response_v2(response_text)
+        else:
+            result = self._parse_response(response_text)
 
         # 更新状态
         self.n_subsidized += 1
@@ -361,7 +514,7 @@ class LLMSubsidyAgent:
         self.fatigue = self.fatigue * 0.85 + 0.15 * (1.0 if self.n_subsidized > 3 else 0.0)
 
         # 记录轨迹
-        self.trajectory.append({
+        entry = {
             "agent_id": self.agent_id,
             "mental_account": self.mental_account,
             "subsidy_amount": subsidy_amount,
@@ -370,7 +523,12 @@ class LLMSubsidyAgent:
             "reasoning": result.get("reasoning", ""),
             "confidence": result.get("confidence", 0.0),
             "fatigue": self.fatigue,
-        })
+        }
+        if merchant is not None:
+            entry["merchant"] = merchant.prototype_id
+            entry["merchant_name"] = merchant.display_name
+            entry["scene"] = merchant.describe_scene(subsidy_amount, threshold, time_of_day)
+        self.trajectory.append(entry)
 
         return result
 
@@ -384,7 +542,7 @@ class LLMSubsidyAgent:
             return "高"
 
     def _parse_response(self, text: str) -> Dict[str, Any]:
-        """解析LLM响应"""
+        """解析LLM响应（v1 JSON格式）"""
         try:
             # 尝试从响应中提取JSON
             json_match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
@@ -406,6 +564,54 @@ class LLMSubsidyAgent:
             "confidence": 0.5,
         }
 
+    def _parse_response_v2(self, text: str) -> Dict[str, Any]:
+        """
+        解析v2格式LLM响应（内心独白式推理）
+
+        预期格式：
+        [内心独白]
+        ...思考过程...
+
+        [决策]
+        核销: 是/否
+
+        也兼容JSON格式和纯文本格式。
+        """
+        # 尝试解析 [决策] 块
+        decision_match = re.search(
+            r'\[决策\]\s*核销\s*[：:]\s*(是|否|true|false|yes|no)',
+            text, re.IGNORECASE
+        )
+        if decision_match:
+            decision_text = decision_match.group(1).lower()
+            redeemed = decision_text in ("是", "true", "yes")
+
+            # 提取内心独白
+            monologue_match = re.search(
+                r'\[内心独白\]\s*(.*?)(?=\[决策\])',
+                text, re.DOTALL
+            )
+            reasoning = monologue_match.group(1).strip() if monologue_match else ""
+
+            return {
+                "redeemed": redeemed,
+                "reasoning": reasoning,
+                "confidence": 0.7,  # 内心独白格式默认中高置信度
+            }
+
+        # 回退到v1 JSON解析
+        json_result = self._parse_response(text)
+        # 如果v1解析到reasoning，额外尝试提取内心独白
+        if not json_result["reasoning"]:
+            monologue_match = re.search(
+                r'\[内心独白\]\s*(.*)',
+                text, re.DOTALL
+            )
+            if monologue_match:
+                json_result["reasoning"] = monologue_match.group(1).strip()[:500]
+
+        return json_result
+
 
 # ===========================================================================
 # LLMAgentSociety
@@ -416,6 +622,8 @@ class LLMAgentSociety:
     LLM Agent社会仿真
 
     管理一组LLMSubsidyAgent，执行多轮仿真。
+
+    v2 升级：支持商家原型注入场景描述
     """
 
     def __init__(
@@ -427,12 +635,14 @@ class LLMAgentSociety:
         base_url: Optional[str] = None,
         model: str = "gpt-4o-mini",
         seed: int = 42,
+        merchant_registry: Optional[Any] = None,
     ):
         np.random.seed(seed)
 
         self.n_agents = n_agents
         self.use_mock = use_mock
         self.results: List[Dict[str, Any]] = []
+        self.merchant_registry = merchant_registry
 
         # 创建LLM客户端
         if not use_mock and api_key:
@@ -459,6 +669,7 @@ class LLMAgentSociety:
                 income_level=income,
                 consumption_freq=np.random.poisson(5),
                 llm_client=self.llm,
+                use_v2_prompt=True,
             )
             self.agents.append(agent)
 
@@ -468,7 +679,20 @@ class LLMAgentSociety:
         round_trajectories = []
 
         for agent in self.agents:
-            result = agent.decide(subsidy_amount, threshold)
+            # 如果有商家注册表，为每个Agent采样一个商家原型
+            merchant = None
+            if self.merchant_registry is not None:
+                merchant = self.merchant_registry.sample_for_user(agent.income_level)
+
+            # 采样时段
+            time_labels = ["早餐时段", "上午", "午餐时段", "下午茶时间", "晚餐时段", "深夜宵夜"]
+            time_of_day = np.random.choice(time_labels)
+
+            result = agent.decide(
+                subsidy_amount, threshold,
+                merchant=merchant,
+                time_of_day=time_of_day,
+            )
             if result["redeemed"]:
                 n_redeemed += 1
             round_trajectories.append(result)
